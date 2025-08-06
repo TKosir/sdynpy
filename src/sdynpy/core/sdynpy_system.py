@@ -841,9 +841,10 @@ class System:
 
         Returns
         -------
-        return_value : np.ndarray
+        return_value : np.ndarray or scipy.sparse matrix
             Portion of the transformation matrix corresponding to the
-            coordinates input to the function.
+            coordinates input to the function. Returns the same type as
+            self.transformation.
 
         """
         consistent_arrays, shape_indices, request_indices = np.intersect1d(
@@ -859,7 +860,20 @@ class System:
         # Handle sign flipping
         multiplications = coordinates.flatten()[request_indices].sign(
         ) * self.coordinate[shape_indices].sign()
-        return_value = self.transformation[shape_indices] * multiplications[:, np.newaxis]
+        
+        # Extract rows from transformation matrix
+        return_value = self.transformation[shape_indices]
+        
+        # Handle sign corrections differently for sparse vs dense matrices
+        if hasattr(self.transformation, 'toarray'):
+            # For sparse matrices, apply sign corrections element-wise to each row
+            for i, mult in enumerate(multiplications):
+                if mult != 1.0:
+                    return_value[i] = return_value[i] * mult
+        else:
+            # For dense matrices, use broadcasting
+            return_value = return_value * multiplications[:, np.newaxis]
+        
         # Invert the indices to return the dofs in the correct order as specified in keys
         inverse_indices = np.zeros(request_indices.shape, dtype=int)
         inverse_indices[request_indices] = np.arange(len(request_indices))
@@ -1861,11 +1875,15 @@ class SystemSparse(System):
         ----------
         reduction_transformation : np.ndarray or scipy.sparse matrix
             Matrix to use in the reduction
+        return_sparse : bool, optional
+            If True, return a SystemSparse object. If False, return a dense System object.
+            The default is False.
 
         Returns
         -------
-        System
-            Reduced system as a dense System object.
+        System or SystemSparse
+            Reduced system. Returns a dense System object by default, or a SystemSparse
+            object if return_sparse is True.
         """
         if not sp.issparse(reduction_transformation):
             reduction_transformation = sp.csr_matrix(reduction_transformation)
@@ -1892,77 +1910,111 @@ class SystemSparse(System):
         
         return System(self.coordinate, mass_dense, stiffness_dense, damping_dense, transformation_dense)
 
-    def constrain(self, constraint_matrix, rcond=None):
+    def constrain(self, constraint_matrix, rcond=None, sparse_threshold=1e4, return_sparse=False):
         """
         Apply a constraint matrix to the sparse system
 
         Parameters
         ----------
         constraint_matrix : np.ndarray or scipy.sparse matrix
-            A matrix of constraints to apply to the structure
+            A matrix of constraints to apply to the structure (B matrix)
         rcond : float, optional
             Condition tolerance for computing the nullspace. The default is None.
+        sparse_threshold : float, optional
+            Size threshold (number of elements) for using sparse vs dense nullspace computation.
+            Default is 1e4 elements.
+        return_sparse : bool, optional
+            If True, return a SystemSparse object. If False (default), return a dense System object.
 
         Returns
         -------
-        System
-            Constrained system as a dense System object.
+        System or SystemSparse
+            Constrained system. Returns System if return_sparse=False, SystemSparse if return_sparse=True.
         """
-        print('Warning: Constrain is not implemented for sparse systems')
-
         if not sp.issparse(constraint_matrix):
             constraint_matrix = sp.csr_matrix(constraint_matrix)
         
-        # Compute nullspace using dense conversion for now
-        # TODO: Implement sparse nullspace computation
-        constraint_dense = constraint_matrix.toarray()
-        substructuring_transform_matrix = null_space(constraint_dense, rcond)
+        # Decide between sparse and dense nullspace computation
+        matrix_size = constraint_matrix.shape[0] * constraint_matrix.shape[1]
         
-        return self.reduce(substructuring_transform_matrix)
-
-    def transformation_matrix_at_coordinates(self, coordinates):
+        if matrix_size < sparse_threshold:
+            # Small matrix: use dense nullspace computation
+            constraint_dense = constraint_matrix.toarray()
+            substructuring_transform_matrix = null_space(constraint_dense, rcond)
+        else:
+            # Large matrix: use sparse nullspace computation
+            substructuring_transform_matrix = self._sparse_nullspace_svd(constraint_matrix, rcond)
+        
+        return self.reduce(substructuring_transform_matrix, return_sparse)
+    
+    def _sparse_nullspace_svd(self, A, rcond=None):
         """
-        Return the transformation matrix at the specified coordinates
-
+        Compute nullspace of sparse matrix A using SVD approach
+        
         Parameters
         ----------
-        coordinates : CoordinateArray
-            coordinates at which the transformation matrix will be computed.
-
+        A : scipy.sparse matrix
+            Constraint matrix
+        rcond : float, optional
+            Condition tolerance for rank determination
+            
         Returns
         -------
-        return_value : scipy.sparse matrix
-            Portion of the transformation matrix corresponding to the
-            coordinates input to the function.
+        np.ndarray
+            Nullspace matrix
         """
-        consistent_arrays, shape_indices, request_indices = np.intersect1d(
-            abs(self.coordinate), abs(coordinates), assume_unique=False, return_indices=True)
+        from scipy.sparse.linalg import svds
         
-        # Make sure that all of the keys are actually in the consistent array matrix
-        if consistent_arrays.size != coordinates.size:
-            extra_keys = np.setdiff1d(abs(coordinates), abs(self.coordinate))
-            if extra_keys.size == 0:
-                raise ValueError(
-                    'Duplicate coordinate values requested.  Please ensure coordinate indices are unique.')
-            raise ValueError(
-                'Not all indices in requested coordinate array exist in the system\n{:}'.format(str(extra_keys)))
+        # Set default rcond
+        if rcond is None:
+            rcond = np.finfo(float).eps * max(A.shape)
         
-        # Handle sign flipping
-        multiplications = coordinates.flatten()[request_indices].sign() * self.coordinate[shape_indices].sign()
-        
-        # Extract rows and apply sign corrections
-        return_value = self.transformation[shape_indices]
-        # Apply sign corrections element-wise to each row
-        for i, mult in enumerate(multiplications):
-            if mult != 1.0:
-                return_value[i] = return_value[i] * mult
-        
-        # Invert the indices to return the dofs in the correct order as specified in keys
-        inverse_indices = np.zeros(request_indices.shape, dtype=int)
-        inverse_indices[request_indices] = np.arange(len(request_indices))
-        return_value = return_value[inverse_indices]
-        
-        return return_value
+        try:
+            # Compute sparse SVD: A = U @ S @ Vt
+            # We need k < min(A.shape) for svds to work
+            max_rank = min(A.shape) - 1
+            
+            if max_rank <= 0:
+                raise ValueError("Matrix is too small for SVD nullspace computation")
+            
+            # Try to compute SVD with maximum possible rank
+            k = min(max_rank, A.nnz)  # Don't ask for more singular values than non-zeros
+            if k <= 0:
+                # Matrix is essentially zero
+                return np.eye(A.shape[1])
+            
+            U, S, Vt = svds(A, k=k)
+            
+            # Sort by descending singular values
+            idx = np.argsort(S)[::-1]
+            S = S[idx]
+            Vt = Vt[idx, :]
+            
+            # Determine rank based on singular values
+            rank = np.sum(S > rcond * S[0]) if S[0] > 0 else 0
+            
+            if rank == A.shape[1]:
+                raise ValueError("Constraint matrix has full rank - no nullspace exists")
+            
+            # Extract nullspace from V (rows of Vt after rank)
+            if rank < len(S):
+                nullspace = Vt[rank:, :].T
+            else:
+                # Need to compute additional nullspace vectors
+                # This happens when SVD didn't capture the full nullspace
+                # Fall back to dense computation for robustness
+                print("Warning: Sparse SVD incomplete, falling back to dense nullspace computation")
+                return null_space(A.toarray(), rcond)
+            
+            return nullspace
+            
+        except Exception as e:
+            # If sparse SVD fails, fall back to dense computation
+            print(f"Warning: Sparse SVD failed ({e}), falling back to dense nullspace computation")
+            try:
+                return null_space(A.toarray(), rcond)
+            except Exception as dense_e:
+                raise ValueError(f"Both sparse and dense nullspace computations failed. Sparse: {e}, Dense: {dense_e}")
 
     def copy(self):
         """
@@ -2178,8 +2230,6 @@ class SystemSparse(System):
             return self.reduce(T_cb_reordered), shapes
         else:
             return self.reduce(T_cb_reordered)
-
-
 
     def save(self, filename):
         """
