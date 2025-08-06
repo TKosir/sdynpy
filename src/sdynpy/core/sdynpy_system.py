@@ -37,6 +37,9 @@ import copy
 import netCDF4 as nc4
 import matplotlib.pyplot as plt
 import warnings
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+from scipy.sparse.linalg import ArpackNoConvergence
 
 
 class System:
@@ -1532,3 +1535,892 @@ class System:
 
 
 substructure_by_position = System.substructure_by_position
+
+
+class SystemSparse(System):
+    """
+    Matrix Equations representing a Structural Dynamics System using sparse matrices
+    
+    This class extends the System class to handle large FEM models using scipy sparse
+    CSR matrices for mass, stiffness, damping, and transformation matrices.
+    """
+
+    def __init__(self, coordinate: CoordinateArray, mass, stiffness, damping=None,
+                 transformation=None):
+        """
+        Create a sparse system representation including mass, stiffness, damping, and
+        transformation matrices.
+
+        Parameters
+        ----------
+        coordinate : CoordinateArray
+            Physical degrees of freedom in the system.
+        mass : scipy.sparse matrix
+            Sparse matrix consisting of the mass matrix of the system
+        stiffness : scipy.sparse matrix
+            Sparse matrix consisting of the stiffness matrix of the system
+        damping : scipy.sparse matrix, optional
+            Sparse matrix consisting of the damping matrix of the system.  If not
+            specified, the damping will be zero.
+        transformation : scipy.sparse matrix, optional
+            A transformation between internal "state" degrees of freedom and
+            the physical degrees of freedom defined in `coordinate`. The
+            default transformation is the identity matrix.
+
+        Raises
+        ------
+        ValueError
+            If inputs are improperly sized
+
+        Returns
+        -------
+        None.
+        """
+        # Convert to CSR format if not already
+        mass = sp.csr_matrix(mass)
+        stiffness = sp.csr_matrix(stiffness)
+        
+        if not mass.shape == stiffness.shape:
+            raise ValueError('Mass and Stiffness matrices must be the same shape')
+        if not mass.ndim == 2 or (mass.shape[0] != mass.shape[1]):
+            raise ValueError('Mass should be a 2D, square array')
+        if not stiffness.ndim == 2 or (stiffness.shape[0] != stiffness.shape[1]):
+            raise ValueError('Stiffness should be a 2D, square array')
+        
+        if damping is None:
+            damping = sp.csr_matrix((stiffness.shape))
+        else:
+            damping = sp.csr_matrix(damping)
+        if not damping.shape == stiffness.shape:
+            raise ValueError('Damping and Stiffness matrices must be the same shape')
+        if not damping.ndim == 2 or (damping.shape[0] != damping.shape[1]):
+            raise ValueError('Damping should be a 2D, square array')
+        
+        if transformation is None:
+            transformation = sp.identity(mass.shape[0], format='csr')
+        else:
+            transformation = sp.csr_matrix(transformation)
+        if not transformation.ndim == 2:
+            raise ValueError('transformation must be 2D')
+        if not transformation.shape[-1] == mass.shape[0]:
+            raise ValueError(
+                'transformation must have number of columns equal to the number of rows in the mass matrix')
+        
+        coordinate = np.atleast_1d(coordinate)
+        if not isinstance(coordinate, CoordinateArray):
+            raise ValueError('coordinate must be a CoordinateArray object')
+        if not coordinate.ndim == 1 or coordinate.shape[0] != transformation.shape[0]:
+            raise ValueError(
+                'coordinate must be 1D and have the same size as transformation.shape[0] or mass.shape[0] if no transformation is specified')
+        
+        # Check symmetry on a subset of non-zero elements for efficiency
+        self._check_sparse_symmetry(mass, 'mass matrix')
+        self._check_sparse_symmetry(stiffness, 'stiffness matrix')
+        self._check_sparse_symmetry(damping, 'damping matrix')
+
+        self._coordinate = coordinate
+        self._mass = mass
+        self._stiffness = stiffness
+        self._damping = damping
+        self._transformation = transformation
+
+    def _check_sparse_symmetry(self, matrix, name, sample_size=1000):
+        """
+        Check symmetry of sparse matrix by sampling non-zero elements
+        
+        Parameters
+        ----------
+        matrix : scipy.sparse matrix
+            Matrix to check for symmetry
+        name : str
+            Name of matrix for error messages
+        sample_size : int, optional
+            Number of non-zero elements to sample for symmetry check
+        """
+        if matrix.nnz == 0:
+            return  # Empty matrix is symmetric
+            
+        # Get non-zero elements
+        rows, cols = matrix.nonzero()
+        data = matrix.data
+        
+        # Sample a subset if matrix is large
+        if len(rows) > sample_size:
+            indices = np.random.choice(len(rows), sample_size, replace=False)
+            rows = rows[indices]
+            cols = cols[indices]
+            data = data[indices]
+        
+        # Check symmetry for sampled elements
+        for i, (r, c) in enumerate(zip(rows, cols)):
+            if r != c:  # Only check off-diagonal elements
+                val_rc = data[i]
+                val_cr = matrix[c, r]
+                if not np.allclose(val_rc, val_cr, atol=1e-6*np.abs(val_rc).max() if np.abs(val_rc).max() > 0 else 1e-6):
+                    raise ValueError(f'{name} must be symmetric')
+
+    @property
+    def mass(self):
+        """Get or set the mass matrix of the system"""
+        return self._mass
+
+    @mass.setter
+    def mass(self, value):
+        """Set the mass matrix of the system"""
+        value = sp.csr_matrix(value)
+        if not value.shape == self.stiffness.shape:
+            raise ValueError('Mass and Stiffness matrices must be the same shape')
+        if not value.ndim == 2 or (value.shape[0] != value.shape[1]):
+            raise ValueError('Mass should be a 2D, square array')
+        self._check_sparse_symmetry(value, 'mass matrix')
+        self._mass = value
+
+    @property
+    def stiffness(self):
+        """Get or set the stiffness matrix of the system"""
+        return self._stiffness
+
+    @stiffness.setter
+    def stiffness(self, value):
+        """Set the stiffness matrix of the system"""
+        value = sp.csr_matrix(value)
+        if not value.shape == self.mass.shape:
+            raise ValueError('Mass and Stiffness matrices must be the same shape')
+        if not value.ndim == 2 or (value.shape[0] != value.shape[1]):
+            raise ValueError('Stiffness should be a 2D, square array')
+        self._check_sparse_symmetry(value, 'stiffness matrix')
+        self._stiffness = value
+
+    @property
+    def damping(self):
+        """Get or set the damping matrix of the system"""
+        return self._damping
+
+    @damping.setter
+    def damping(self, value):
+        """Set the damping matrix of the system"""
+        value = sp.csr_matrix(value)
+        if not value.shape == self.stiffness.shape:
+            raise ValueError('damping and Stiffness matrices must be the same shape')
+        if not value.ndim == 2 or (value.shape[0] != value.shape[1]):
+            raise ValueError('damping should be a 2D, square array')
+        self._check_sparse_symmetry(value, 'damping matrix')
+        self._damping = value
+
+    @property
+    def transformation(self):
+        """Get or set the transformation matrix"""
+        return self._transformation
+
+    @transformation.setter
+    def transformation(self, value):
+        """Set the transformation matrix"""
+        value = sp.csr_matrix(value)
+        if not value.ndim == 2:
+            raise ValueError('transformation must be 2D')
+        if not value.shape[-1] == self.mass.shape[0]:
+            raise ValueError(
+                'transformation must have number of columns equal to the number of rows in the mass matrix')
+        self._transformation = value
+
+    # Alias properties for convenience
+    M = mass
+    K = stiffness
+    C = damping
+
+    def spy(self, subplots_kwargs={'figsize': (10, 3)}, spy_kwargs={}):
+        """
+        Plot the structure of the sparse system's matrices
+
+        Parameters
+        ----------
+        subplots_kwargs : dict, optional
+            Default arguments passed to `matplotlib.pyplot`'s `subplots` function.
+            The default is {'figsize':(10,3)}.
+        spy_kwargs : dict, optional
+            Default arguments passed to `matplotlib.pyplot`'s 'spy' function.
+            The default is {}.
+
+        Returns
+        -------
+        ax : Axes
+            Axes on which the subplots are defined.
+        """
+        fig, ax = plt.subplots(1, 3, squeeze=True, **subplots_kwargs)
+        
+        # Use sparse-specific spy plotting
+        ax[0].spy(self.transformation, **spy_kwargs)
+        
+        # Combine system matrices for visualization
+        combined = abs(self.mass) + abs(self.stiffness) + abs(self.damping)
+        ax[1].spy(combined, **spy_kwargs)
+        
+        ax[2].spy(self.transformation.T, **spy_kwargs)
+        
+        ax[0].set_title('Output Transformation')
+        ax[1].set_title('Internal State Matrices')
+        ax[2].set_title('Input Transformation')
+        fig.tight_layout()
+        return ax
+
+    def eigensolution(self, num_modes=None, maximum_frequency=None, complex_modes=False, return_shape=True):
+        """
+        Computes the eigensolution of the sparse system
+
+        Parameters
+        ----------
+        num_modes : int, optional
+            The number of modes of the system to compute. The default is to
+            compute all the modes.
+        maximum_frequency : float, optional
+            The maximum frequency to which modes will be computed.
+            The default is to compute all the modes.
+        complex_modes : bool, optional
+            Whether or not complex modes are computed. The default is False.
+        return_shape : bool, optional
+            Specifies whether or not to return a `ShapeArray` (True) or a reduced
+            `System` (False). The default is True.
+
+        Returns
+        -------
+        System or ShapeArray
+            If `return_shape` is True, then a ShapeArray will be returned.  If
+            `return_shape` is False, a reduced System will be returned.
+        """
+        if complex_modes:
+            raise NotImplementedError('Complex modes not yet implemented for sparse systems')
+        
+        # Use sparse eigenvalue solver
+        if num_modes is None:
+            num_modes = min(self.ndof - 2, 50)  # Default to reasonable number for sparse
+        
+        # Ensure we don't ask for more modes than possible
+        max_modes = min(num_modes, self.ndof - 2)
+        
+        # Convert frequency to eigenvalue range if specified
+        if maximum_frequency is not None:
+            sigma = (2 * np.pi * maximum_frequency)**2
+            # Use shift-invert mode to find eigenvalues near sigma
+            lam, phi = spla.eigsh(self.K, max_modes, self.M, sigma=sigma, which='LM', tol=1e-3)
+        else:
+            # Find smallest eigenvalues using shift-invert
+            sigma = 1.0
+            lam, phi = spla.eigsh(self.K, max_modes, self.M, sigma=sigma, which='LM', tol=1e-3)
+        
+        # Sort by frequency
+        idx = np.argsort(lam)
+        lam = lam[idx]
+        phi = phi[:, idx]
+        
+        # Mass normalize the mode shapes
+        lam[lam < 0] = 0
+        freq = np.sqrt(lam) / (2 * np.pi)
+        
+        # Convert to dense for mass normalization
+        phi_dense = phi
+        mass_dense = self.M.toarray()
+        damping_dense = self.C.toarray()
+        
+        normalized_mass = np.diag(phi_dense.T @ mass_dense @ phi_dense)
+        phi_dense /= np.sqrt(normalized_mass)
+        
+        # Compute modal damping
+        with np.errstate(divide='ignore', invalid='ignore'):
+            damping = np.diag(phi_dense.T @ damping_dense @ phi_dense) / (2 * (2 * np.pi * freq))
+        damping[np.isnan(damping)] = 0.0
+        damping[np.isinf(damping)] = 0.0
+        
+        # Apply transformation to get back to physical dofs
+        phi_physical = self.transformation @ phi_dense
+        
+        if return_shape:
+            from .sdynpy_shape import shape_array
+            return shape_array(self.coordinate, phi_physical.T, freq, damping)
+        else:
+            # Return a dense System for the modal system
+            return System(self.coordinate, 
+                         np.eye(freq.size), 
+                         np.diag((2 * np.pi * freq)**2), 
+                         np.diag(2 * (2 * np.pi * freq) * damping), 
+                         phi_physical)
+
+    def reduce(self, reduction_transformation):
+        """
+        Apply the specified reduction to the sparse model
+
+        Parameters
+        ----------
+        reduction_transformation : np.ndarray or scipy.sparse matrix
+            Matrix to use in the reduction
+
+        Returns
+        -------
+        System
+            Reduced system as a dense System object.
+        """
+        if not sp.issparse(reduction_transformation):
+            reduction_transformation = sp.csr_matrix(reduction_transformation)
+        
+        # Perform sparse matrix operations
+        mass = reduction_transformation.T @ self.mass @ reduction_transformation
+        stiffness = reduction_transformation.T @ self.stiffness @ reduction_transformation
+        damping = reduction_transformation.T @ self.damping @ reduction_transformation
+        transformation = self.transformation @ reduction_transformation
+        
+        # Convert to dense arrays for the reduced system
+        mass_dense = mass.toarray()
+        stiffness_dense = stiffness.toarray()
+        damping_dense = damping.toarray()
+        transformation_dense = transformation.toarray()
+        
+        # Force symmetry
+        mass_dense = (mass_dense + mass_dense.T) / 2
+        stiffness_dense = (stiffness_dense + stiffness_dense.T) / 2
+        damping_dense = (damping_dense + damping_dense.T) / 2
+        
+        return System(self.coordinate, mass_dense, stiffness_dense, damping_dense, transformation_dense)
+
+    def constrain(self, constraint_matrix, rcond=None):
+        """
+        Apply a constraint matrix to the sparse system
+
+        Parameters
+        ----------
+        constraint_matrix : np.ndarray or scipy.sparse matrix
+            A matrix of constraints to apply to the structure
+        rcond : float, optional
+            Condition tolerance for computing the nullspace. The default is None.
+
+        Returns
+        -------
+        System
+            Constrained system as a dense System object.
+        """
+        if not sp.issparse(constraint_matrix):
+            constraint_matrix = sp.csr_matrix(constraint_matrix)
+        
+        # Compute nullspace using dense conversion for now
+        # TODO: Implement sparse nullspace computation
+        constraint_dense = constraint_matrix.toarray()
+        substructuring_transform_matrix = null_space(constraint_dense, rcond)
+        
+        return self.reduce(substructuring_transform_matrix)
+
+    def transformation_matrix_at_coordinates(self, coordinates):
+        """
+        Return the transformation matrix at the specified coordinates
+
+        Parameters
+        ----------
+        coordinates : CoordinateArray
+            coordinates at which the transformation matrix will be computed.
+
+        Returns
+        -------
+        return_value : scipy.sparse matrix
+            Portion of the transformation matrix corresponding to the
+            coordinates input to the function.
+        """
+        consistent_arrays, shape_indices, request_indices = np.intersect1d(
+            abs(self.coordinate), abs(coordinates), assume_unique=False, return_indices=True)
+        
+        # Make sure that all of the keys are actually in the consistent array matrix
+        if consistent_arrays.size != coordinates.size:
+            extra_keys = np.setdiff1d(abs(coordinates), abs(self.coordinate))
+            if extra_keys.size == 0:
+                raise ValueError(
+                    'Duplicate coordinate values requested.  Please ensure coordinate indices are unique.')
+            raise ValueError(
+                'Not all indices in requested coordinate array exist in the system\n{:}'.format(str(extra_keys)))
+        
+        # Handle sign flipping
+        multiplications = coordinates.flatten()[request_indices].sign() * self.coordinate[shape_indices].sign()
+        
+        # Extract rows and apply sign corrections
+        return_value = self.transformation[shape_indices]
+        # Apply sign corrections element-wise to each row
+        for i, mult in enumerate(multiplications):
+            if mult != 1.0:
+                return_value[i] = return_value[i] * mult
+        
+        # Invert the indices to return the dofs in the correct order as specified in keys
+        inverse_indices = np.zeros(request_indices.shape, dtype=int)
+        inverse_indices[request_indices] = np.arange(len(request_indices))
+        return_value = return_value[inverse_indices]
+        
+        return return_value
+
+    def copy(self):
+        """
+        Returns a copy of the sparse system object
+
+        Returns
+        -------
+        SystemSparse
+            A copy of the sparse system object
+        """
+        return SystemSparse(self.coordinate.copy(), 
+                           self.mass.copy(), 
+                           self.stiffness.copy(),
+                           self.damping.copy(), 
+                           self.transformation.copy())
+
+    def set_proportional_damping(self, mass_fraction, stiffness_fraction):
+        """
+        Sets the damping matrix to a proportion of the mass and stiffness matrices.
+
+        The damping matrix will be set to `mass_fraction*self.mass +
+        stiffness_fraction*self.stiffness`
+
+        Parameters
+        ----------
+        mass_fraction : float
+            Fraction of the mass matrix
+        stiffness_fraction : float
+            Fraction of the stiffness matrix
+        """
+        self.damping = self.mass * mass_fraction + self.stiffness * stiffness_fraction
+
+    def assign_modal_damping(self, damping_ratios):
+        """
+        Assigns a damping matrix to the sparse system that results in equivalent
+        modal damping
+
+        Parameters
+        ----------
+        damping_ratios : ndarray
+            An array of damping values to assign to the system
+        """
+        damping_ratios = np.array(damping_ratios)
+        if damping_ratios.ndim == 1:
+            shapes = self.eigensolution(num_modes=damping_ratios.size)
+        else:
+            shapes = self.eigensolution()
+        shapes.damping = damping_ratios
+        # Compute the damping matrix
+        modal_system = shapes.system()
+        shape_pinv = np.linalg.pinv(modal_system.transformation.T)
+        full_damping_matrix = shape_pinv @ modal_system.damping @ shape_pinv.T
+        self.damping = sp.csr_matrix(full_damping_matrix)
+
+    def get_indices_by_coordinate(self, coordinates, ignore_sign=False):
+        """
+        Gets the indices in the transformation matrix corresponding coordinates
+
+        Parameters
+        ----------
+        coordinates : CoordinateArray
+            Coordinates to extract transformation indices
+        ignore_sign : bool, optional
+            Specify whether or not to ignore signs on the coordinates.  If True,
+            then '101X+' would match '101X+' or '101X-'. The default is False.
+
+        Returns
+        -------
+        np.ndarray
+            Array of indices.
+        """
+        if ignore_sign:
+            consistent_arrays, shape_indices, request_indices = np.intersect1d(
+                abs(self.coordinate), abs(coordinates), assume_unique=False, return_indices=True)
+        else:
+            consistent_arrays, shape_indices, request_indices = np.intersect1d(
+                self.coordinate, coordinates, assume_unique=False, return_indices=True)
+        # Make sure that all of the keys are actually in the consistent array matrix
+        if consistent_arrays.size != coordinates.size:
+            extra_keys = np.setdiff1d(abs(coordinates), abs(self.coordinate))
+            if extra_keys.size == 0:
+                raise ValueError(
+                    'Duplicate coordinate values requested.  Please ensure coordinate indices are unique.')
+            raise ValueError(
+                'Not all indices in requested coordinate array exist in the system\n{:}'.format(str(extra_keys)))
+        # Handle sign flipping
+        return_value = shape_indices
+        # Invert the indices to return the dofs in the correct order as specified in keys
+        inverse_indices = np.zeros(request_indices.shape, dtype=int)
+        inverse_indices[request_indices] = np.arange(len(request_indices))
+        return return_value[inverse_indices]
+
+    def reduce_guyan(self, coordinates):
+        """
+        Perform Guyan reduction on the sparse system
+
+        Parameters
+        ----------
+        coordinates : CoordinateArray
+            A list of coordinates to keep in the reduced system.
+
+        Returns
+        -------
+        System
+            Reduced system as a dense System object.
+        """
+        if isinstance(coordinates, CoordinateArray):
+            if not sp.issparse(self.transformation) or not np.allclose(self.transformation.toarray(), np.eye(*self.transformation.shape)):
+                raise ValueError(
+                    'Coordinates can only be specified with a CoordinateArray if the transformation is identity')
+            keep_dofs = self.get_indices_by_coordinate(coordinates)
+        else:
+            keep_dofs = np.array(coordinates)
+        discard_dofs = np.array([i for i in range(self.ndof) if i not in keep_dofs])
+        I_a = sp.identity(keep_dofs.size, format='csr')
+        K_dd = self.stiffness[discard_dofs][:, discard_dofs]
+        K_da = self.stiffness[discard_dofs][:, keep_dofs]
+        
+        # Add small regularization to handle potential singularity from rigid body modes
+        # Use setdiag to avoid changing sparsity structure
+        K_dd_reg = K_dd.copy()
+        K_dd_reg.setdiag(K_dd_reg.diagonal() + 1e-12)
+        
+        # Solve sparse system
+        T_guyan_bottom = -spla.spsolve(K_dd_reg, K_da.toarray())
+        if T_guyan_bottom.ndim == 1:
+            T_guyan_bottom = T_guyan_bottom[:, np.newaxis]
+        
+        T_guyan = sp.vstack([I_a, sp.csr_matrix(T_guyan_bottom)])
+        
+        # Reorder rows
+        reorder_indices = np.concatenate((keep_dofs, discard_dofs))
+        T_guyan_reordered = sp.csr_matrix((T_guyan.shape[0], T_guyan.shape[1]))
+        T_guyan_reordered[reorder_indices] = T_guyan
+        
+        return self.reduce(T_guyan_reordered)
+
+    def reduce_dynamic(self, coordinates, frequency):
+        """
+        Perform Dynamic condensation on the sparse system
+
+        Parameters
+        ----------
+        coordinates : CoordinateArray
+            A list of coordinates to keep in the reduced system.
+        frequency : float
+            The frequency to preserve in the dynamic reduction.
+
+        Returns
+        -------
+        System
+            Reduced system as a dense System object.
+        """
+        if isinstance(coordinates, CoordinateArray):
+            if not sp.issparse(self.transformation) or not np.allclose(self.transformation.toarray(), np.eye(*self.transformation.shape)):
+                raise ValueError(
+                    'Coordinates can only be specified with a CoordinateArray if the transformation is identity')
+            keep_dofs = self.get_indices_by_coordinate(coordinates)
+        else:
+            keep_dofs = np.array(coordinates)
+        discard_dofs = np.array([i for i in range(self.ndof) if i not in keep_dofs])
+        I_a = sp.identity(keep_dofs.size, format='csr')
+        D = self.stiffness - (2 * np.pi * frequency)**2 * self.mass
+        D_dd = D[discard_dofs][:, discard_dofs]
+        D_da = D[discard_dofs][:, keep_dofs]
+        
+        # Add small regularization to handle potential singularity
+        # Use setdiag to avoid changing sparsity structure
+        D_dd_reg = D_dd.copy()
+        D_dd_reg.setdiag(D_dd_reg.diagonal() + 1e-12)
+        
+        # Solve sparse system
+        T_dynamic_bottom = -spla.spsolve(D_dd_reg, D_da.toarray())
+        if T_dynamic_bottom.ndim == 1:
+            T_dynamic_bottom = T_dynamic_bottom[:, np.newaxis]
+            
+        T_dynamic = sp.vstack([I_a, sp.csr_matrix(T_dynamic_bottom)])
+        
+        # Reorder rows
+        reorder_indices = np.concatenate((keep_dofs, discard_dofs))
+        T_dynamic_reordered = sp.csr_matrix((T_dynamic.shape[0], T_dynamic.shape[1]))
+        T_dynamic_reordered[reorder_indices] = T_dynamic
+        
+        return self.reduce(T_dynamic_reordered)
+
+    def reduce_craig_bampton(self, connection_degrees_of_freedom: CoordinateArray,
+                             num_fixed_base_modes: int,
+                             return_shape_matrix: bool = False):
+        """
+        Computes a craig-bampton substructure model for the sparse system
+
+        Parameters
+        ----------
+        connection_degrees_of_freedom : CoordinateArray
+            Degrees of freedom to keep at the interface.
+        num_fixed_base_modes : int
+            Number of fixed-base modes to use in the reduction
+        return_shape_matrix : bool, optional
+            If true, return a set of shapes that represents the transformation
+            in addition to the reduced system.  The default is False.
+
+        Returns
+        -------
+        System
+            Reduced system in craig-bampton form as a dense System object
+        ShapeArray, optional
+            Shapes representing the craig-bampton transformation if requested
+        """
+        # Construct craig bampton transformation
+        if isinstance(connection_degrees_of_freedom, CoordinateArray):
+            if not sp.issparse(self.transformation) or not np.allclose(self.transformation.toarray(), np.eye(*self.transformation.shape)):
+                raise ValueError(
+                    'Coordinates can only be specified with a CoordinateArray if the transformation is identity')
+            connection_indices = self.get_indices_by_coordinate(connection_degrees_of_freedom)
+        else:
+            connection_indices = np.array(connection_degrees_of_freedom)
+        other_indices = np.array([i for i in range(self.ndof) if i not in connection_indices])
+
+        # Extract portions of the mass and stiffness matrices
+        K_ii = self.K[other_indices][:, other_indices]
+        M_ii = self.M[other_indices][:, other_indices]
+        K_ib = self.K[other_indices][:, connection_indices]
+
+        # Compute fixed interface modes using sparse eigenvalue solver
+        max_modes = min(num_fixed_base_modes, K_ii.shape[0] - 2)
+        sigma = 1.0
+        lam, Phi_ii = spla.eigsh(K_ii, max_modes, M_ii, sigma=sigma, which='LM', tol=1e-3)
+        
+        # Sort by eigenvalue
+        idx = np.argsort(lam)
+        lam = lam[idx]
+        Phi_ii = Phi_ii[:, idx]
+        
+        # Normalize the mode shapes
+        lam[lam < 0] = 0
+        M_ii_dense = M_ii.toarray()
+        normalized_mass = np.diag(Phi_ii.T @ M_ii_dense @ Phi_ii)
+        Phi_ii /= np.sqrt(normalized_mass)
+        
+        Z_bi = np.zeros((connection_indices.size, num_fixed_base_modes))
+        
+        # Compute constraint modes
+        # Add small regularization to handle potential singularity
+        # Use setdiag to avoid changing sparsity structure
+        K_ii_reg = K_ii.copy()
+        K_ii_reg.setdiag(K_ii_reg.diagonal() + 1e-12)
+        Psi_ib = -spla.spsolve(K_ii_reg, K_ib.toarray())
+        if Psi_ib.ndim == 1:
+            Psi_ib = Psi_ib[:, np.newaxis]
+        I_bb = np.eye(connection_indices.size)
+        
+        T_cb = np.block([[Phi_ii, Psi_ib],
+                         [Z_bi, I_bb]])
+        
+        # Reorder rows
+        reorder_indices = np.concatenate((other_indices, connection_indices))
+        T_cb_reordered = np.zeros((T_cb.shape[0], T_cb.shape[1]))
+        T_cb_reordered[reorder_indices] = T_cb
+        
+        if return_shape_matrix:
+            from .sdynpy_shape import shape_array
+            freq = np.sqrt(lam) / (2 * np.pi)
+            all_freqs = np.concatenate((freq, np.zeros(connection_indices.size)))
+            shapes = shape_array(self.coordinate, T_cb_reordered.T, all_freqs, comment1=['Fixed Base Mode {:}'.format(
+                i + 1) for i in range(num_fixed_base_modes)] + ['Constraint Mode {:}'.format(str(dof)) for dof in connection_degrees_of_freedom])
+            return self.reduce(T_cb_reordered), shapes
+        else:
+            return self.reduce(T_cb_reordered)
+
+    def substructure_by_coordinate(self, dof_pairs, rcond=None,
+                                   return_constrained_system=True):
+        """
+        Constrain the sparse system by connecting the specified degree of freedom pairs
+
+        Parameters
+        ----------
+        dof_pairs : iterable of CoordinateArray
+            Pairs of coordinates to be connected.  None can be passed instead of
+            a second degree of freedom to constrain to ground
+        rcond : float, optional
+            Condition threshold to use for the nullspace calculation on the
+            constraint matrix. The default is None.
+        return_constrained_system : bool, optional
+            If true, apply the constraint matrix and return the constrained
+            system, otherwise simply return the constraint matrix. The default
+            is True.
+
+        Returns
+        -------
+        np.ndarray or System
+            Returns a System object with the constraints applied if
+            `return_constrained_system` is True, otherwise just return the
+            constraint matrix.
+        """
+        constraint_matrix = []
+        for constraint_dof_0, constraint_dof_1 in dof_pairs:
+            constraint = self.transformation_matrix_at_coordinates(constraint_dof_0)
+            if constraint_dof_1 is not None:
+                constraint -= self.transformation_matrix_at_coordinates(constraint_dof_1)
+            constraint_matrix.append(constraint.toarray())  # Convert to dense for concatenation
+        constraint_matrix = np.concatenate(constraint_matrix, axis=0)
+        if return_constrained_system:
+            return self.constrain(constraint_matrix, rcond)
+        else:
+            return constraint_matrix
+
+    def substructure_by_shape(self, constraint_shapes, connection_dofs_0,
+                              connection_dofs_1=None, rcond=None,
+                              return_constrained_system=True):
+        """
+        Constrain the sparse system using a set of shapes in a least-squares sense.
+
+        Parameters
+        ----------
+        constraint_shapes : ShapeArray
+            An array of shapes to use as the basis for the constraints
+        connection_dofs_0 : CoordinateArray
+            Array of coordinates to use in the constraints
+        connection_dofs_1 : CoordinateArray, optional
+            Array of coordinates to constrain to the coordinates in
+            `connection_dofs_0`. If not specified, the `connection_dofs_0`
+            degrees of freedom will be constrained to ground.
+        rcond : float, optional
+            Condition threshold on the nullspace calculation. The default is None.
+        return_constrained_system : bool, optional
+            If true, apply the constraint matrix and return the constrained
+            system, otherwise simply return the constraint matrix. The default
+            is True.
+
+        Returns
+        -------
+        np.ndarray or System
+            Returns a System object with the constraints applied if
+            `return_constrained_system` is True, otherwise just return the
+            constraint matrix.
+        """
+        shape_matrix_0 = constraint_shapes[connection_dofs_0].T
+        transform_matrix_0 = self.transformation_matrix_at_coordinates(connection_dofs_0).toarray()
+        constraint_matrix = np.linalg.lstsq(shape_matrix_0, transform_matrix_0)[0]
+        if connection_dofs_1 is not None:
+            shape_matrix_1 = constraint_shapes[connection_dofs_1].T
+            transform_matrix_1 = self.transformation_matrix_at_coordinates(connection_dofs_1).toarray()
+            constraint_matrix -= np.linalg.lstsq(shape_matrix_1, transform_matrix_1)[0]
+        if return_constrained_system:
+            return self.constrain(constraint_matrix, rcond)
+        else:
+            return constraint_matrix
+
+    def save(self, filename):
+        """
+        Saves the sparse system to a file
+
+        Parameters
+        ----------
+        filename : str
+            Name of the file in which the system will be saved.
+        """
+        # Save sparse matrices in their sparse format to avoid memory issues
+        import pickle
+        
+        save_data = {
+            'mass': self.mass,
+            'stiffness': self.stiffness,
+            'damping': self.damping,
+            'transformation': self.transformation,
+            'coordinate': self.coordinate,
+            'sparse_format': True
+        }
+        
+        with open(filename, 'wb') as f:
+            pickle.dump(save_data, f)
+
+    @classmethod
+    def load(cls, filename):
+        """
+        Load a sparse system from a file
+
+        Parameters
+        ----------
+        filename : str
+            Name of the file from which the system will be loaded.
+
+        Returns
+        -------
+        SystemSparse
+            A sparse system consisting of the mass, stiffness, damping, and transformation
+            in the file
+        """
+        import pickle
+        
+        try:
+            # Try to load as pickle first (new format)
+            with open(filename, 'rb') as f:
+                data = pickle.load(f)
+            
+            if isinstance(data, dict) and data.get('sparse_format', False):
+                return cls(data['coordinate'], 
+                          data['mass'],
+                          data['stiffness'], 
+                          data['damping'], 
+                          data['transformation'])
+            else:
+                raise ValueError("File does not contain sparse system data")
+                
+        except (pickle.UnpicklingError, FileNotFoundError):
+            # Fallback to old numpy format for backward compatibility
+            try:
+                data = np.load(filename)
+                return cls(data['coordinate'].view(CoordinateArray), 
+                          sp.csr_matrix(data['mass']),
+                          sp.csr_matrix(data['stiffness']), 
+                          sp.csr_matrix(data['damping']), 
+                          sp.csr_matrix(data['transformation']))
+            except Exception as e:
+                raise ValueError(f"Could not load sparse system from {filename}: {e}")
+
+
+
+    @classmethod
+    def concatenate(cls, systems, coordinate_node_offset=0):
+        """
+        Combine multiple sparse systems together
+
+        Parameters
+        ----------
+        systems : iterable of SystemSparse objects
+            Iterable of SystemSparse objects that will be concatenated.  Matrices will be
+            assembled in block diagonal format
+        coordinate_node_offset : int, optional
+            Offset applied to the coordinates so the nodes do not overlap.
+            The default is 0.
+
+        Returns
+        -------
+        SystemSparse
+            A sparse system consisting of the combination of the provided systems.
+        """
+        coordinates = [system.coordinate.copy() for system in systems]
+        if coordinate_node_offset != 0:
+            for i in range(len(coordinates)):
+                coordinates[i].node += coordinate_node_offset * (i + 1)
+        all_coordinates = np.concatenate(coordinates)
+        
+        # Use scipy's block_diag for sparse matrices
+        return cls(all_coordinates,
+                   sp.block_diag([system.mass for system in systems], format='csr'),
+                   sp.block_diag([system.stiffness for system in systems], format='csr'),
+                   sp.block_diag([system.damping for system in systems], format='csr'),
+                   sp.block_diag([system.transformation for system in systems], format='csr'))
+
+    # Methods that are not implemented for sparse systems
+    def beam(self, *args, **kwargs):
+        """Not implemented for sparse systems"""
+        raise NotImplementedError("beam() method not implemented for SystemSparse. Use System.beam() instead.")
+
+    def to_state_space(self, *args, **kwargs):
+        """Not implemented for sparse systems"""
+        raise NotImplementedError("to_state_space() method not implemented for SystemSparse")
+
+    def time_integrate(self, *args, **kwargs):
+        """Not implemented for sparse systems"""
+        raise NotImplementedError("time_integrate() method not implemented for SystemSparse")
+
+    def frequency_response(self, *args, **kwargs):
+        """Not implemented for sparse systems"""
+        raise NotImplementedError("frequency_response() method not implemented for SystemSparse")
+
+    @classmethod
+    def from_exodus_superelement(cls, *args, **kwargs):
+        """Not implemented for sparse systems"""
+        raise NotImplementedError("from_exodus_superelement() method not implemented for SystemSparse")
+
+    def simulate_test(self, *args, **kwargs):
+        """Not implemented for sparse systems"""
+        raise NotImplementedError("simulate_test() method not implemented for SystemSparse")

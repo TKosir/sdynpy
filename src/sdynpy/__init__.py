@@ -60,6 +60,7 @@ GUIPlot = data.GUIPlot
 CPSDPlot = data.CPSDPlot
 id_map = geometry.id_map
 System = system.System
+SystemSparse = system.SystemSparse
 matrix_plot = correlation.matrix_plot
 Matrix = matrix_mod.Matrix
 matrix = matrix_mod.matrix
