@@ -1569,7 +1569,7 @@ class SystemSparse(System):
     """
 
     def __init__(self, coordinate: CoordinateArray, mass, stiffness, damping=None,
-                 transformation=None):
+                 transformation=None, check_symmetry_sample_size=None):
         """
         Create a sparse system representation including mass, stiffness, damping, and
         transformation matrices.
@@ -1637,9 +1637,9 @@ class SystemSparse(System):
                 'coordinate must be 1D and have the same size as transformation.shape[0] or mass.shape[0] if no transformation is specified')
         
         # Check symmetry on a subset of non-zero elements for efficiency
-        self._check_sparse_symmetry(mass, 'mass matrix')
-        self._check_sparse_symmetry(stiffness, 'stiffness matrix')
-        self._check_sparse_symmetry(damping, 'damping matrix')
+        self._check_sparse_symmetry(mass, 'mass matrix', check_symmetry_sample_size)
+        self._check_sparse_symmetry(stiffness, 'stiffness matrix', check_symmetry_sample_size)
+        self._check_sparse_symmetry(damping, 'damping matrix', check_symmetry_sample_size)
 
         self._coordinate = coordinate
         self._mass = mass
@@ -1647,9 +1647,9 @@ class SystemSparse(System):
         self._damping = damping
         self._transformation = transformation
 
-    def _check_sparse_symmetry(self, matrix, name, sample_size=1000):
+    def _check_sparse_symmetry(self, matrix, name, sample_size=None):
         """
-        Check symmetry of sparse matrix by sampling non-zero elements
+        Check symmetry of sparse matrix by sampling non-zero elements or full matrix difference
         
         Parameters
         ----------
@@ -1657,30 +1657,53 @@ class SystemSparse(System):
             Matrix to check for symmetry
         name : str
             Name of matrix for error messages
-        sample_size : int, optional
-            Number of non-zero elements to sample for symmetry check
+        sample_size : int or None, optional
+            Number of non-zero elements to sample for symmetry check.
+            If None (default), performs full matrix difference check for 100% accuracy.
+            If int, performs probabilistic sampling for faster checking.
         """
         if matrix.nnz == 0:
             return  # Empty matrix is symmetric
+        
+        if sample_size is None:
+            # Full matrix difference check for 100% accuracy
+            diff = matrix - matrix.T
             
-        # Get non-zero elements
-        rows, cols = matrix.nonzero()
-        data = matrix.data
-        
-        # Sample a subset if matrix is large
-        if len(rows) > sample_size:
-            indices = np.random.choice(len(rows), sample_size, replace=False)
-            rows = rows[indices]
-            cols = cols[indices]
-            data = data[indices]
-        
-        # Check symmetry for sampled elements
-        for i, (r, c) in enumerate(zip(rows, cols)):
-            if r != c:  # Only check off-diagonal elements
-                val_rc = data[i]
-                val_cr = matrix[c, r]
-                if not np.allclose(val_rc, val_cr, atol=1e-6*np.abs(val_rc).max() if np.abs(val_rc).max() > 0 else 1e-6):
-                    raise ValueError(f'{name} must be symmetric')
+            if diff.nnz == 0:
+                # Matrices are exactly symmetric
+                return
+            else:
+                # Check if differences are within tolerance
+                max_diff = abs(diff.data).max() if diff.nnz > 0 else 0.0
+                diff_sum = abs(diff.sum())
+                
+                # Use both absolute and relative tolerance
+                matrix_scale = max(abs(matrix.data).max() if matrix.nnz > 0 else 1.0, 1e-12)
+                tolerance = 1e-12 * matrix_scale
+                
+                if max_diff > tolerance or diff_sum > tolerance:
+                    raise ValueError(f'{name} must be symmetric (max diff: {max_diff:.2e}, sum diff: {diff_sum:.2e}, tolerance: {tolerance:.2e})')
+        else:
+            # Sampling-based check for performance
+            # Get non-zero element positions
+            rows, cols = matrix.nonzero()
+            
+            # Sample a subset if matrix is large
+            if len(rows) > sample_size:
+                indices = np.random.choice(len(rows), sample_size, replace=False)
+                sample_rows = rows[indices]
+                sample_cols = cols[indices]
+            else:
+                sample_rows = rows
+                sample_cols = cols
+            
+            # Check symmetry for sampled elements
+            for r, c in zip(sample_rows, sample_cols):
+                if r != c:  # Only check off-diagonal elements
+                    val_rc = matrix[r, c]  # Get value directly from matrix
+                    val_cr = matrix[c, r]  # Get symmetric counterpart
+                    if not np.allclose(val_rc, val_cr, atol=1e-6*max(abs(val_rc), abs(val_cr), 1e-12)):
+                        raise ValueError(f'{name} must be symmetric')
 
     @property
     def mass(self):

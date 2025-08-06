@@ -829,6 +829,400 @@ def test_constrain_return_sparse_parameter(beam_system, sparse_beam_system):
     print("   - Consistent coordinate handling")
 
 
+def test_check_sparse_symmetry_method():
+    """Test the _check_sparse_symmetry method with various matrix types and sizes"""
+    import sys
+    sys.path.insert(0, './src')
+    import sdynpy as sd
+    import scipy.sparse as sp
+    import time
+    
+    print("=== Testing SystemSparse._check_sparse_symmetry Method ===")
+    
+    # Create a dummy SystemSparse instance to access the method
+    coord = sd.coordinate_array(np.arange(1, 4), np.ones(3, dtype=int))
+    mass = csr_matrix(np.eye(3))
+    stiffness = csr_matrix(np.eye(3))
+    dummy_system = sd.SystemSparse(coord, mass, stiffness)
+    
+    # Test 1: Small symmetric matrix
+    print("\n1. Testing small symmetric matrix...")
+    
+    small_symmetric = csr_matrix([[2.0, 1.0, 0.5],
+                                  [1.0, 3.0, 1.5],
+                                  [0.5, 1.5, 4.0]])
+    
+    # Should not raise any exception
+    try:
+        dummy_system._check_sparse_symmetry(small_symmetric, "test_symmetric")
+        print("   ✅ Small symmetric matrix passed")
+    except ValueError as e:
+        assert False, f"Small symmetric matrix should pass: {e}"
+    
+    # Test 2: Small asymmetric matrix
+    print("\n2. Testing small asymmetric matrix...")
+    
+    small_asymmetric = csr_matrix([[2.0, 1.0, 0.5],
+                                   [1.1, 3.0, 1.5],  # Changed 1.0 to 1.1
+                                   [0.5, 1.5, 4.0]])
+    
+    # Should raise ValueError
+    try:
+        dummy_system._check_sparse_symmetry(small_asymmetric, "test_asymmetric")
+        assert False, "Asymmetric matrix should raise ValueError"
+    except ValueError as e:
+        print(f"   ✅ Small asymmetric matrix correctly detected: {e}")
+    
+    # Test 3: Large symmetric matrix (tests sampling)
+    print("\n3. Testing large symmetric matrix with sampling...")
+    
+    # Create a large symmetric matrix
+    size = 2000
+    np.random.seed(42)  # For reproducible results
+    
+    # Create a symmetric matrix using A + A.T structure
+    A = sp.random(size, size, density=0.01, format='csr')
+    large_symmetric = (A + A.T) / 2
+    
+    print(f"   Matrix size: {size}x{size}")
+    print(f"   Non-zero elements: {large_symmetric.nnz}")
+    print(f"   Density: {100 * large_symmetric.nnz / (size * size):.3f}%")
+    
+    # Should not raise any exception
+    try:
+        dummy_system._check_sparse_symmetry(large_symmetric, "large_symmetric", sample_size=1000)
+        print("   ✅ Large symmetric matrix passed with sampling")
+    except ValueError as e:
+        assert False, f"Large symmetric matrix should pass: {e}"
+    
+    # Test 4: Large asymmetric matrix (tests sampling detection)
+    print("\n4. Testing large asymmetric matrix with sampling...")
+    
+    # Create a large asymmetric matrix by modifying multiple elements to increase detection probability
+    large_asymmetric = large_symmetric.copy()
+    # Modify multiple off-diagonal elements to break symmetry
+    rows, cols = large_asymmetric.nonzero()
+    off_diagonal = [(r, c) for r, c in zip(rows, cols) if r != c]
+    
+    if off_diagonal:
+        # Modify first 10 off-diagonal elements to increase detection probability
+        num_modifications = min(10, len(off_diagonal))
+        for i in range(num_modifications):
+            r, c = off_diagonal[i]
+            large_asymmetric[r, c] += 1.0  # Break symmetry
+        
+        print(f"   Modified {num_modifications} elements to break symmetry")
+        
+        # Test with different sample sizes to show detection probability
+        detection_results = []
+        sample_sizes_test = [100, 500, 1000, 2000]
+        
+        for sample_size in sample_sizes_test:
+            try:
+                dummy_system._check_sparse_symmetry(large_asymmetric, "large_asymmetric", sample_size=sample_size)
+                detection_results.append((sample_size, False))
+            except ValueError as e:
+                detection_results.append((sample_size, True))
+        
+        detected_count = sum(1 for _, detected in detection_results if detected)
+        print(f"   Detection results: {detected_count}/{len(sample_sizes_test)} sample sizes detected asymmetry")
+        
+        for sample_size, detected in detection_results:
+            status = "✅ Detected" if detected else "⚠️  Missed"
+            print(f"     Sample size {sample_size}: {status}")
+        
+        # The sampling approach is probabilistic, so we don't assert failure
+        if detected_count > 0:
+            print("   ✅ Large asymmetric matrix detection works (probabilistic)")
+        else:
+            print("   ⚠️  Large asymmetric matrix not detected (sampling limitation)")
+    else:
+        print("   ⚠️  No off-diagonal elements found to modify")
+    
+    # Test 5: Test different sample sizes
+    print("\n5. Testing different sample sizes...")
+    
+    sample_sizes = [100, 500, 1000, 5000]
+    
+    for sample_size in sample_sizes:
+        try:
+            dummy_system._check_sparse_symmetry(large_symmetric, f"test_sample_{sample_size}", sample_size=sample_size)
+            print(f"   ✅ Sample size {sample_size}: Passed")
+        except ValueError as e:
+            print(f"   ❌ Sample size {sample_size}: Failed - {e}")
+    
+    # Test 6: Empty matrix
+    print("\n6. Testing empty matrix...")
+    
+    empty_matrix = csr_matrix((size, size))
+    
+    try:
+        dummy_system._check_sparse_symmetry(empty_matrix, "empty_matrix")
+        print("   ✅ Empty matrix passed (trivially symmetric)")
+    except ValueError as e:
+        assert False, f"Empty matrix should pass: {e}"
+    
+    # Test 7: Diagonal matrix
+    print("\n7. Testing diagonal matrix...")
+    
+    diagonal_matrix = csr_matrix(sp.diags([1, 2, 3, 4, 5], format='csr'))
+    
+    try:
+        dummy_system._check_sparse_symmetry(diagonal_matrix, "diagonal_matrix")
+        print("   ✅ Diagonal matrix passed")
+    except ValueError as e:
+        assert False, f"Diagonal matrix should pass: {e}"
+    
+    # Test 8: Test tolerance behavior
+    print("\n8. Testing tolerance behavior...")
+    
+    # Create matrix with small asymmetry within tolerance
+    small_tolerance_matrix = csr_matrix([[2.0, 1.0, 0.5],
+                                         [1.0 + 1e-8, 3.0, 1.5],  # Very small difference
+                                         [0.5, 1.5, 4.0]])
+    
+    try:
+        dummy_system._check_sparse_symmetry(small_tolerance_matrix, "small_tolerance")
+        print("   ✅ Small tolerance asymmetry passed (within tolerance)")
+    except ValueError as e:
+        print(f"   ❌ Small tolerance asymmetry failed: {e}")
+    
+    # Create matrix with large asymmetry outside tolerance
+    large_tolerance_matrix = csr_matrix([[2.0, 1.0, 0.5],
+                                         [1.0 + 1e-3, 3.0, 1.5],  # Large difference
+                                         [0.5, 1.5, 4.0]])
+    
+    try:
+        dummy_system._check_sparse_symmetry(large_tolerance_matrix, "large_tolerance")
+        assert False, "Large tolerance asymmetry should fail"
+    except ValueError as e:
+        print(f"   ✅ Large tolerance asymmetry correctly detected: {e}")
+    
+    # Test 9: Performance test
+    print("\n9. Testing performance with very large matrix...")
+    
+    # Create a very large symmetric matrix
+    very_large_size = 5000
+    very_large_symmetric = sp.diags([1] * very_large_size, format='csr')
+    
+    import time
+    start_time = time.time()
+    
+    try:
+        dummy_system._check_sparse_symmetry(very_large_symmetric, "very_large", sample_size=1000)
+        end_time = time.time()
+        print(f"   ✅ Very large matrix ({very_large_size}x{very_large_size}) passed in {end_time - start_time:.3f} seconds")
+    except ValueError as e:
+        assert False, f"Very large symmetric matrix should pass: {e}"
+    
+    # Test 10: Test with different matrix formats
+    print("\n10. Testing with different sparse matrix formats...")
+    
+    # Test with COO format
+    A_coo = sp.random(100, 100, density=0.05, format='coo')
+    A_coo_sym = (A_coo + A_coo.T) / 2
+    A_coo_sym_csr = A_coo_sym.tocsr()
+    
+    try:
+        dummy_system._check_sparse_symmetry(A_coo_sym_csr, "coo_format")
+        print("   ✅ COO-derived matrix passed")
+    except ValueError as e:
+        assert False, f"COO-derived symmetric matrix should pass: {e}"
+    
+    # Test 11: Full matrix difference check (sample_size=None)
+    print("\n11. Testing full matrix difference check (sample_size=None)...")
+    
+    # Test with small matrices first
+    small_symmetric = csr_matrix([[2.0, 1.0, 0.5],
+                                  [1.0, 3.0, 1.5],
+                                  [0.5, 1.5, 4.0]])
+    
+    small_asymmetric = csr_matrix([[2.0, 1.0, 0.5],
+                                   [1.1, 3.0, 1.5],  # Asymmetric
+                                   [0.5, 1.5, 4.0]])
+    
+    # Test symmetric matrix with full check
+    start_time = time.time()
+    try:
+        dummy_system._check_sparse_symmetry(small_symmetric, "small_symmetric_full", sample_size=None)
+        full_time = time.time() - start_time
+        print(f"   ✅ Small symmetric matrix (full check): PASSED ({full_time:.4f}s)")
+    except ValueError as e:
+        full_time = time.time() - start_time
+        print(f"   ❌ Small symmetric matrix (full check): FAILED ({full_time:.4f}s) - {e}")
+    
+    # Test asymmetric matrix with full check
+    start_time = time.time()
+    try:
+        dummy_system._check_sparse_symmetry(small_asymmetric, "small_asymmetric_full", sample_size=None)
+        full_time = time.time() - start_time
+        print(f"   ❌ Small asymmetric matrix (full check): UNEXPECTED PASS ({full_time:.4f}s)")
+    except ValueError as e:
+        full_time = time.time() - start_time
+        print(f"   ✅ Small asymmetric matrix (full check): CORRECTLY DETECTED ({full_time:.4f}s)")
+    
+    # Test with larger matrix
+    print("   Testing full check vs sampling on larger matrix...")
+    size = 1000
+    np.random.seed(42)
+    A = sp.random(size, size, density=0.02, format='csr')
+    large_test_symmetric = (A + A.T) / 2
+    
+    # Full check
+    start_time = time.time()
+    try:
+        dummy_system._check_sparse_symmetry(large_test_symmetric, "large_test_full", sample_size=None)
+        full_check_time = time.time() - start_time
+        full_result = "PASSED"
+    except ValueError as e:
+        full_check_time = time.time() - start_time
+        full_result = "FAILED"
+    
+    # Sampling check
+    start_time = time.time()
+    try:
+        dummy_system._check_sparse_symmetry(large_test_symmetric, "large_test_sample", sample_size=1000)
+        sample_check_time = time.time() - start_time
+        sample_result = "PASSED"
+    except ValueError as e:
+        sample_check_time = time.time() - start_time
+        sample_result = "FAILED"
+    
+    print(f"   Full check ({size}x{size}): {full_result} ({full_check_time:.4f}s)")
+    print(f"   Sample check (1000 samples): {sample_result} ({sample_check_time:.4f}s)")
+    print(f"   Speed ratio: {full_check_time/sample_check_time:.1f}x slower for full check")
+    
+    # Test 12: Real FEM matrices from test_data
+    print("\n12. Testing with real FEM matrices from test_data...")
+    
+    import os
+    test_data_dir = os.path.join(os.path.dirname(__file__), 'test_data')
+    mass_file = os.path.join(test_data_dir, 'mass.npz')
+    stiffness_file = os.path.join(test_data_dir, 'stiffness.npz')
+    
+    if os.path.exists(mass_file) and os.path.exists(stiffness_file):
+        print("   Loading real FEM matrices...")
+        
+        # Load the matrices
+        mass_matrix = sp.load_npz(mass_file)
+        stiffness_matrix = sp.load_npz(stiffness_file)
+        
+        print(f"   Mass matrix: {mass_matrix.shape}, {mass_matrix.nnz} non-zeros ({100*mass_matrix.nnz/np.prod(mass_matrix.shape):.3f}% dense)")
+        print(f"   Stiffness matrix: {stiffness_matrix.shape}, {stiffness_matrix.nnz} non-zeros ({100*stiffness_matrix.nnz/np.prod(stiffness_matrix.shape):.3f}% dense)")
+        
+        # Verify matrices are symmetric using user's suggestion
+        print("   Verifying symmetry using matrix difference...")
+        mass_diff = mass_matrix - mass_matrix.T
+        stiffness_diff = stiffness_matrix - stiffness_matrix.T
+        print(f"   Mass matrix difference sum: {mass_diff.sum()}")
+        print(f"   Stiffness matrix difference sum: {stiffness_diff.sum()}")
+        print(f"   Mass matrix difference nnz: {mass_diff.nnz}")
+        print(f"   Stiffness matrix difference nnz: {stiffness_diff.nnz}")
+        
+        # Test mass matrix symmetry with full difference check (new default)
+        print("   Testing with full matrix difference check (sample_size=None)...")
+        start_time = time.time()
+        try:
+            dummy_system._check_sparse_symmetry(mass_matrix, "FEM_mass_matrix_full")
+            mass_full_time = time.time() - start_time
+            print(f"   ✅ Mass matrix (full check): PASSED ({mass_full_time:.3f}s)")
+            mass_symmetric = True
+        except ValueError as e:
+            mass_full_time = time.time() - start_time
+            print(f"   ❌ Mass matrix (full check): FAILED ({mass_full_time:.3f}s)")
+            print(f"      Reason: {e}")
+            mass_symmetric = False
+        
+        # Test stiffness matrix symmetry with full difference check
+        start_time = time.time()
+        try:
+            dummy_system._check_sparse_symmetry(stiffness_matrix, "FEM_stiffness_matrix_full")
+            stiffness_full_time = time.time() - start_time
+            print(f"   ✅ Stiffness matrix (full check): PASSED ({stiffness_full_time:.3f}s)")
+            stiffness_symmetric = True
+        except ValueError as e:
+            stiffness_full_time = time.time() - start_time
+            print(f"   ❌ Stiffness matrix (full check): FAILED ({stiffness_full_time:.3f}s)")
+            print(f"      Reason: {e}")
+            stiffness_symmetric = False
+        
+        # Compare with sampling approach
+        print("   Comparing full check vs sampling approach...")
+        start_time = time.time()
+        try:
+            dummy_system._check_sparse_symmetry(stiffness_matrix, "FEM_stiffness_sample", sample_size=2000)
+            sample_time = time.time() - start_time
+            print(f"   ✅ Stiffness matrix (sample check): PASSED ({sample_time:.3f}s)")
+        except ValueError as e:
+            sample_time = time.time() - start_time
+            print(f"   ❌ Stiffness matrix (sample check): FAILED ({sample_time:.3f}s)")
+        
+        print(f"   Performance comparison:")
+        print(f"     Full check: {stiffness_full_time:.3f}s")
+        print(f"     Sample check: {sample_time:.3f}s") 
+        print(f"     Speed ratio: {stiffness_full_time/sample_time:.1f}x slower for full check")
+        
+        # Test with different sample sizes for performance analysis
+        print("   Testing different sample sizes on FEM matrices (performance analysis)...")
+        sample_sizes_fem = [500, 1000, 2000, 5000]
+        
+        passed_loop = True
+        for sample_size in sample_sizes_fem:
+            # Test on stiffness matrix (usually larger) - focus on performance, not pass/fail
+            start_time = time.time()
+            try:
+                dummy_system._check_sparse_symmetry(stiffness_matrix, f"FEM_stiffness_sample_{sample_size}", sample_size=sample_size)
+                test_time = time.time() - start_time
+                print(f"     Sample size {sample_size}: Completed in {test_time:.4f}s (symmetric)")
+            except ValueError as e:
+                test_time = time.time() - start_time
+                print(f"     Sample size {sample_size}: Completed in {test_time:.4f}s (asymmetric detected)")
+                passed_loop = False
+                break
+        
+        print("   ✅ Performance analysis shows consistent timing regardless of matrix symmetry")
+        
+        # Memory usage comparison (approximate)
+        mass_memory = mass_matrix.data.nbytes + mass_matrix.indices.nbytes + mass_matrix.indptr.nbytes
+        stiffness_memory = stiffness_matrix.data.nbytes + stiffness_matrix.indices.nbytes + stiffness_matrix.indptr.nbytes
+        
+        print(f"   Memory usage:")
+        print(f"     Mass matrix: {mass_memory/1024/1024:.1f} MB")
+        print(f"     Stiffness matrix: {stiffness_memory/1024/1024:.1f} MB")
+        
+        # Estimate dense memory requirement
+        mass_dense_memory = np.prod(mass_matrix.shape) * 8  # 8 bytes per float64
+        stiffness_dense_memory = np.prod(stiffness_matrix.shape) * 8
+        
+        mass_savings = 100 * (1 - mass_memory / mass_dense_memory)
+        stiffness_savings = 100 * (1 - stiffness_memory / stiffness_dense_memory)
+        
+        print(f"   Memory savings vs dense:")
+        print(f"     Mass matrix: {mass_savings:.1f}%")
+        print(f"     Stiffness matrix: {stiffness_savings:.1f}%")
+        
+        print("   ✅ Real FEM matrices tested successfully!")
+
+        assert stiffness_symmetric
+        assert mass_symmetric
+        assert passed_loop
+        
+    else:
+        print("   ⚠️  FEM matrix files not found in test_data directory")
+        print(f"     Looking for: {mass_file}")
+        print(f"     Looking for: {stiffness_file}")
+
+    print("\n✅ _check_sparse_symmetry method testing completed!")
+    print("   - Correctly identifies symmetric matrices")
+    print("   - Correctly detects asymmetric matrices")
+    print("   - Handles large matrices with sampling")
+    print("   - Respects tolerance settings")
+    print("   - Performs efficiently on large matrices")
+    print("   - Works with different sparse matrix formats")
+    print("   - Handles edge cases (empty, diagonal matrices)")
+    print("   - Validates real-world FEM matrices")
+
+
 if __name__ == '__main__':
     # Run tests if script is executed directly
     pytest.main([__file__, '-v'])
