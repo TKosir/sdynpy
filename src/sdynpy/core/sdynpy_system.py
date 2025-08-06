@@ -1589,6 +1589,10 @@ class SystemSparse(System):
             A transformation between internal "state" degrees of freedom and
             the physical degrees of freedom defined in `coordinate`. The
             default transformation is the identity matrix.
+        check_symmetry_sample_size : int or None, optional
+            Number of non-zero elements to sample for symmetry check.
+            If None (default), performs full matrix difference check for 100% accuracy.
+            If int, performs probabilistic sampling for faster (not necessarily faster) checking.
 
         Raises
         ------
@@ -1646,6 +1650,9 @@ class SystemSparse(System):
         self._stiffness = stiffness
         self._damping = damping
         self._transformation = transformation
+
+    def __repr__(self):
+        return 'Sparse System with {:} DoFs ({:} internal DoFs)'.format(self.ndof_transformed, self.ndof)
 
     def _check_sparse_symmetry(self, matrix, name, sample_size=None):
         """
@@ -2195,9 +2202,9 @@ class SystemSparse(System):
         """
         # Construct craig bampton transformation
         if isinstance(connection_degrees_of_freedom, CoordinateArray):
-            if not sp.issparse(self.transformation) or not np.allclose(self.transformation.toarray(), np.eye(*self.transformation.shape)):
-                raise ValueError(
-                    'Coordinates can only be specified with a CoordinateArray if the transformation is identity')
+            # if not sp.issparse(self.transformation) or not np.allclose(self.transformation.toarray(), np.eye(*self.transformation.shape)):
+            #     raise ValueError(
+            #         'Coordinates can only be specified with a CoordinateArray if the transformation is identity')
             connection_indices = self.get_indices_by_coordinate(connection_degrees_of_freedom)
         else:
             connection_indices = np.array(connection_degrees_of_freedom)

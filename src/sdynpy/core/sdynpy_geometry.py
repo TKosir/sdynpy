@@ -839,6 +839,8 @@ class ShapePlotter(GeometryPlotter):
         self.loop_action.setChecked(True)
         self.plot_comments_action.setChecked(True)
 
+        self._print_warning = True
+
         plotter, self.face_mesh_undeformed, self.point_mesh_undeformed, self.solid_mesh_undeformed = geometry.plot(plotter=self,
                                                                                                                    opacity=undeformed_opacity,
                                                                                                                    **plot_kwargs)
@@ -886,11 +888,16 @@ class ShapePlotter(GeometryPlotter):
         shape_displacements = self.shapes[self.current_shape].shape_matrix[..., self.indices]
         node_displacements = np.zeros(self.geometry.node.shape + (3,),
                                       dtype=shape_displacements.dtype)
+        
+        warning_flag = False
         for node_index, node in self.geometry.node.ndenumerate():
             try:
                 node_indices = self.coordinate_node_index_map[node.id]
             except KeyError:
-                print('Node {:} not found in shape array'.format(node.id))
+                if self._print_warning:
+                    print('Node {:} not found in shape array'.format(node.id))
+                    warning_flag = True
+
                 node_displacements[node_index] = 0
                 continue
             node_deflection_scales = shape_displacements[node_indices]
@@ -906,6 +913,9 @@ class ShapePlotter(GeometryPlotter):
                 np.max(global_coords, axis=0) - np.min(global_coords, axis=0))
             self.displacement_scale = 0.05 * bbox_diagonal / \
                 max_displacement  # Set to 5% of bounding box dimension
+            
+        if warning_flag:
+            self._print_warning = False # Only print warning once
 
     def update_shape_mode(self, phase=None):
         """
