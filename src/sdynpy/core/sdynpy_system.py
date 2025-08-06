@@ -897,6 +897,9 @@ class System:
             constraint = self.transformation_matrix_at_coordinates(constraint_dof_0)
             if constraint_dof_1 is not None:
                 constraint -= self.transformation_matrix_at_coordinates(constraint_dof_1)
+            # Convert sparse matrices to dense for concatenation
+            if hasattr(constraint, 'toarray'):
+                constraint = constraint.toarray()
             constraint_matrix.append(constraint)
         constraint_matrix = np.concatenate(constraint_matrix, axis=0)
         if return_constrained_system:
@@ -937,10 +940,16 @@ class System:
         """
         shape_matrix_0 = constraint_shapes[connection_dofs_0].T
         transform_matrix_0 = self.transformation_matrix_at_coordinates(connection_dofs_0)
+        # Convert sparse matrices to dense for np.linalg.lstsq
+        if hasattr(transform_matrix_0, 'toarray'):
+            transform_matrix_0 = transform_matrix_0.toarray()
         constraint_matrix = np.linalg.lstsq(shape_matrix_0, transform_matrix_0)[0]
         if connection_dofs_1 is not None:
             shape_matrix_1 = constraint_shapes[connection_dofs_1].T
             transform_matrix_1 = self.transformation_matrix_at_coordinates(connection_dofs_1)
+            # Convert sparse matrices to dense for np.linalg.lstsq
+            if hasattr(transform_matrix_1, 'toarray'):
+                transform_matrix_1 = transform_matrix_1.toarray()
             constraint_matrix -= np.linalg.lstsq(shape_matrix_1, transform_matrix_1)[0]
         if return_constrained_system:
             return self.constrain(constraint_matrix, rcond)
@@ -1763,7 +1772,7 @@ class SystemSparse(System):
         fig.tight_layout()
         return ax
 
-    def eigensolution(self, num_modes=None, maximum_frequency=None, complex_modes=False, return_shape=True):
+    def eigensolution(self, num_modes=None, maximum_frequency=None, complex_modes=False, return_shape=True, tol=1e-6):
         """
         Computes the eigensolution of the sparse system
 
@@ -1801,11 +1810,11 @@ class SystemSparse(System):
         if maximum_frequency is not None:
             sigma = (2 * np.pi * maximum_frequency)**2
             # Use shift-invert mode to find eigenvalues near sigma
-            lam, phi = spla.eigsh(self.K, max_modes, self.M, sigma=sigma, which='LM', tol=1e-3)
+            lam, phi = spla.eigsh(self.K, max_modes, self.M, sigma=sigma, which='LM', tol=tol)
         else:
             # Find smallest eigenvalues using shift-invert
             sigma = 1.0
-            lam, phi = spla.eigsh(self.K, max_modes, self.M, sigma=sigma, which='LM', tol=1e-3)
+            lam, phi = spla.eigsh(self.K, max_modes, self.M, sigma=sigma, which='LM', tol=tol)
         
         # Sort by frequency
         idx = np.argsort(lam)
@@ -1844,7 +1853,7 @@ class SystemSparse(System):
                          np.diag(2 * (2 * np.pi * freq) * damping), 
                          phi_physical)
 
-    def reduce(self, reduction_transformation):
+    def reduce(self, reduction_transformation, return_sparse=False):
         """
         Apply the specified reduction to the sparse model
 
@@ -1866,6 +1875,9 @@ class SystemSparse(System):
         stiffness = reduction_transformation.T @ self.stiffness @ reduction_transformation
         damping = reduction_transformation.T @ self.damping @ reduction_transformation
         transformation = self.transformation @ reduction_transformation
+
+        if return_sparse:
+            return SystemSparse(self.coordinate, mass, stiffness, damping, transformation)
         
         # Convert to dense arrays for the reduced system
         mass_dense = mass.toarray()
@@ -1896,6 +1908,8 @@ class SystemSparse(System):
         System
             Constrained system as a dense System object.
         """
+        print('Warning: Constrain is not implemented for sparse systems')
+
         if not sp.issparse(constraint_matrix):
             constraint_matrix = sp.csr_matrix(constraint_matrix)
         
@@ -1965,22 +1979,6 @@ class SystemSparse(System):
                            self.damping.copy(), 
                            self.transformation.copy())
 
-    def set_proportional_damping(self, mass_fraction, stiffness_fraction):
-        """
-        Sets the damping matrix to a proportion of the mass and stiffness matrices.
-
-        The damping matrix will be set to `mass_fraction*self.mass +
-        stiffness_fraction*self.stiffness`
-
-        Parameters
-        ----------
-        mass_fraction : float
-            Fraction of the mass matrix
-        stiffness_fraction : float
-            Fraction of the stiffness matrix
-        """
-        self.damping = self.mass * mass_fraction + self.stiffness * stiffness_fraction
-
     def assign_modal_damping(self, damping_ratios):
         """
         Assigns a damping matrix to the sparse system that results in equivalent
@@ -2002,44 +2000,6 @@ class SystemSparse(System):
         shape_pinv = np.linalg.pinv(modal_system.transformation.T)
         full_damping_matrix = shape_pinv @ modal_system.damping @ shape_pinv.T
         self.damping = sp.csr_matrix(full_damping_matrix)
-
-    def get_indices_by_coordinate(self, coordinates, ignore_sign=False):
-        """
-        Gets the indices in the transformation matrix corresponding coordinates
-
-        Parameters
-        ----------
-        coordinates : CoordinateArray
-            Coordinates to extract transformation indices
-        ignore_sign : bool, optional
-            Specify whether or not to ignore signs on the coordinates.  If True,
-            then '101X+' would match '101X+' or '101X-'. The default is False.
-
-        Returns
-        -------
-        np.ndarray
-            Array of indices.
-        """
-        if ignore_sign:
-            consistent_arrays, shape_indices, request_indices = np.intersect1d(
-                abs(self.coordinate), abs(coordinates), assume_unique=False, return_indices=True)
-        else:
-            consistent_arrays, shape_indices, request_indices = np.intersect1d(
-                self.coordinate, coordinates, assume_unique=False, return_indices=True)
-        # Make sure that all of the keys are actually in the consistent array matrix
-        if consistent_arrays.size != coordinates.size:
-            extra_keys = np.setdiff1d(abs(coordinates), abs(self.coordinate))
-            if extra_keys.size == 0:
-                raise ValueError(
-                    'Duplicate coordinate values requested.  Please ensure coordinate indices are unique.')
-            raise ValueError(
-                'Not all indices in requested coordinate array exist in the system\n{:}'.format(str(extra_keys)))
-        # Handle sign flipping
-        return_value = shape_indices
-        # Invert the indices to return the dofs in the correct order as specified in keys
-        inverse_indices = np.zeros(request_indices.shape, dtype=int)
-        inverse_indices[request_indices] = np.arange(len(request_indices))
-        return return_value[inverse_indices]
 
     def reduce_guyan(self, coordinates):
         """
@@ -2136,7 +2096,8 @@ class SystemSparse(System):
 
     def reduce_craig_bampton(self, connection_degrees_of_freedom: CoordinateArray,
                              num_fixed_base_modes: int,
-                             return_shape_matrix: bool = False):
+                             return_shape_matrix: bool = False,
+                             tol:float=1e-6):
         """
         Computes a craig-bampton substructure model for the sparse system
 
@@ -2175,7 +2136,7 @@ class SystemSparse(System):
         # Compute fixed interface modes using sparse eigenvalue solver
         max_modes = min(num_fixed_base_modes, K_ii.shape[0] - 2)
         sigma = 1.0
-        lam, Phi_ii = spla.eigsh(K_ii, max_modes, M_ii, sigma=sigma, which='LM', tol=1e-3)
+        lam, Phi_ii = spla.eigsh(K_ii, max_modes, M_ii, sigma=sigma, which='LM', tol=tol)
         
         # Sort by eigenvalue
         idx = np.argsort(lam)
@@ -2218,84 +2179,7 @@ class SystemSparse(System):
         else:
             return self.reduce(T_cb_reordered)
 
-    def substructure_by_coordinate(self, dof_pairs, rcond=None,
-                                   return_constrained_system=True):
-        """
-        Constrain the sparse system by connecting the specified degree of freedom pairs
 
-        Parameters
-        ----------
-        dof_pairs : iterable of CoordinateArray
-            Pairs of coordinates to be connected.  None can be passed instead of
-            a second degree of freedom to constrain to ground
-        rcond : float, optional
-            Condition threshold to use for the nullspace calculation on the
-            constraint matrix. The default is None.
-        return_constrained_system : bool, optional
-            If true, apply the constraint matrix and return the constrained
-            system, otherwise simply return the constraint matrix. The default
-            is True.
-
-        Returns
-        -------
-        np.ndarray or System
-            Returns a System object with the constraints applied if
-            `return_constrained_system` is True, otherwise just return the
-            constraint matrix.
-        """
-        constraint_matrix = []
-        for constraint_dof_0, constraint_dof_1 in dof_pairs:
-            constraint = self.transformation_matrix_at_coordinates(constraint_dof_0)
-            if constraint_dof_1 is not None:
-                constraint -= self.transformation_matrix_at_coordinates(constraint_dof_1)
-            constraint_matrix.append(constraint.toarray())  # Convert to dense for concatenation
-        constraint_matrix = np.concatenate(constraint_matrix, axis=0)
-        if return_constrained_system:
-            return self.constrain(constraint_matrix, rcond)
-        else:
-            return constraint_matrix
-
-    def substructure_by_shape(self, constraint_shapes, connection_dofs_0,
-                              connection_dofs_1=None, rcond=None,
-                              return_constrained_system=True):
-        """
-        Constrain the sparse system using a set of shapes in a least-squares sense.
-
-        Parameters
-        ----------
-        constraint_shapes : ShapeArray
-            An array of shapes to use as the basis for the constraints
-        connection_dofs_0 : CoordinateArray
-            Array of coordinates to use in the constraints
-        connection_dofs_1 : CoordinateArray, optional
-            Array of coordinates to constrain to the coordinates in
-            `connection_dofs_0`. If not specified, the `connection_dofs_0`
-            degrees of freedom will be constrained to ground.
-        rcond : float, optional
-            Condition threshold on the nullspace calculation. The default is None.
-        return_constrained_system : bool, optional
-            If true, apply the constraint matrix and return the constrained
-            system, otherwise simply return the constraint matrix. The default
-            is True.
-
-        Returns
-        -------
-        np.ndarray or System
-            Returns a System object with the constraints applied if
-            `return_constrained_system` is True, otherwise just return the
-            constraint matrix.
-        """
-        shape_matrix_0 = constraint_shapes[connection_dofs_0].T
-        transform_matrix_0 = self.transformation_matrix_at_coordinates(connection_dofs_0).toarray()
-        constraint_matrix = np.linalg.lstsq(shape_matrix_0, transform_matrix_0)[0]
-        if connection_dofs_1 is not None:
-            shape_matrix_1 = constraint_shapes[connection_dofs_1].T
-            transform_matrix_1 = self.transformation_matrix_at_coordinates(connection_dofs_1).toarray()
-            constraint_matrix -= np.linalg.lstsq(shape_matrix_1, transform_matrix_1)[0]
-        if return_constrained_system:
-            return self.constrain(constraint_matrix, rcond)
-        else:
-            return constraint_matrix
 
     def save(self, filename):
         """
@@ -2364,8 +2248,6 @@ class SystemSparse(System):
                           sp.csr_matrix(data['transformation']))
             except Exception as e:
                 raise ValueError(f"Could not load sparse system from {filename}: {e}")
-
-
 
     @classmethod
     def concatenate(cls, systems, coordinate_node_offset=0):

@@ -74,17 +74,48 @@ def test_eigensolution_comparison(beam_system, sparse_beam_system):
     
     # Compute eigensolution for both
     dense_shapes = dense_system.eigensolution(num_modes=num_modes)
-    sparse_shapes = sparse_system.eigensolution(num_modes=num_modes)
+    sparse_shapes = sparse_system.eigensolution(num_modes=num_modes, tol=1e-20)
     
     # Skip first 6 modes (rigid body modes) and compare the rest
-    dense_freq_structural = np.sort(dense_shapes.frequency[6:11])  # Take modes 7-11 (5 structural modes)
-    sparse_freq_structural = np.sort(sparse_shapes.frequency[6:11])  # Take modes 7-11 (5 structural modes)
+    dense_freq_structural = np.sort(dense_shapes.frequency[6:19])  # Take modes 7-11 (5 structural modes)
+    sparse_freq_structural = np.sort(sparse_shapes.frequency[6:19])  # Take modes 7-11 (5 structural modes)
     
     print(f"Dense structural frequencies: {dense_freq_structural}")
     print(f"Sparse structural frequencies: {sparse_freq_structural}")
     
     # Allow some tolerance due to numerical differences in solvers
     assert np.allclose(dense_freq_structural, sparse_freq_structural, rtol=1e-2)
+    
+    # Perform modal reduction using the mode shapes
+    dense_modal = dense_system.reduce(dense_shapes.modeshape)
+    sparse_modal = sparse_system.reduce(sparse_shapes.modeshape)
+    
+    # Check that modal mass matrices are identity (mass normalized)
+    dense_modal_mass_diag = np.diag(dense_modal.mass)
+    sparse_modal_mass_diag = np.diag(sparse_modal.mass)
+    
+    print(f"Dense modal mass diagonal: {dense_modal_mass_diag}")
+    print(f"Sparse modal mass diagonal: {sparse_modal_mass_diag}")
+    
+    # Modal mass should be close to 1.0 for mass-normalized modes
+    assert np.allclose(dense_modal_mass_diag, 1.0, rtol=1e-10)
+    assert np.allclose(sparse_modal_mass_diag, 1.0, rtol=1e-10)
+    
+    # Compare modal stiffness matrices (should be eigenvalues)
+    dense_modal_stiff_diag = np.diag(dense_modal.stiffness)
+    sparse_modal_stiff_diag = np.diag(sparse_modal.stiffness)
+    
+    print(f"Dense modal stiffness diagonal: {dense_modal_stiff_diag[6:]}")
+    print(f"Sparse modal stiffness diagonal: {sparse_modal_stiff_diag[6:]}")
+    
+    # Modal stiffness should be equal between dense and sparse systems
+    assert np.allclose(dense_modal_stiff_diag[6:], sparse_modal_stiff_diag[6:], rtol=1e-2)
+    
+    # Modal stiffness should equal (2*pi*frequency)^2
+    expected_stiffness = (2 * np.pi * dense_shapes.frequency)**2
+    assert np.allclose(dense_modal_stiff_diag[6:], expected_stiffness[6:], rtol=1e-2)
+    expected_stiffness = (2 * np.pi * sparse_shapes.frequency)**2
+    assert np.allclose(sparse_modal_stiff_diag[6:], expected_stiffness[6:], rtol=1e-2)
 
 def test_guyan_reduction_comparison(beam_system, sparse_beam_system):
     """Test Guyan reduction gives similar results"""
@@ -137,7 +168,7 @@ def test_dynamic_reduction_comparison(beam_system, sparse_beam_system):
 
 def test_craig_bampton_reduction_comparison(beam_system, sparse_beam_system):
     """Test Craig-Bampton reduction gives similar results"""
-    dense_system, _ = beam_system
+    dense_system, geometry = beam_system
     sparse_system, _ = sparse_beam_system
     
     # Select interface coordinates (end nodes)
@@ -147,7 +178,7 @@ def test_craig_bampton_reduction_comparison(beam_system, sparse_beam_system):
     
     # Perform Craig-Bampton reduction
     dense_reduced = dense_system.reduce_craig_bampton(interface_coords, num_modes)
-    sparse_reduced = sparse_system.reduce_craig_bampton(interface_coords, num_modes)
+    sparse_reduced = sparse_system.reduce_craig_bampton(interface_coords, num_modes, tol=1e-20)
     
     # Compare reduced system properties
     assert dense_reduced.ndof == sparse_reduced.ndof
@@ -160,6 +191,9 @@ def test_craig_bampton_reduction_comparison(beam_system, sparse_beam_system):
     
     assert np.allclose(mass_diag_dense, mass_diag_sparse, rtol=1e-6)
     assert np.allclose(stiff_diag_dense, stiff_diag_sparse, rtol=1e-6)
+
+    #assert np.allclose(dense_reduced.stiffness, sparse_reduced.stiffness, rtol=1e-1)
+    #assert np.allclose(dense_reduced.mass, sparse_reduced.mass, rtol=1e-1)
     
     # Check that the Frobenius norms are similar (overall matrix properties)
     mass_norm_ratio = np.linalg.norm(sparse_reduced.mass, 'fro') / np.linalg.norm(dense_reduced.mass, 'fro')
@@ -171,6 +205,45 @@ def test_craig_bampton_reduction_comparison(beam_system, sparse_beam_system):
     print(f"Craig-Bampton reduced DOFs: {dense_reduced.ndof}")
     print(f"Mass matrix norm ratio: {mass_norm_ratio:.6f}")
     print(f"Stiffness matrix norm ratio: {stiff_norm_ratio:.6f}")
+    
+    # Substructuring example using existing systems and geometries
+    print("\n--- Substructuring Example ---")
+    
+    # Create two copies of geometries for substructuring
+    geom1 = geometry.copy()
+    geom2 = geometry.copy()
+    # Offset the second geometry by -0.3 in X direction
+    geom2.coordinate_system.matrix[0, -1, :] = np.array([-0.3, 0, 0])
+    
+    # Create copies of the reduced systems
+    sys1 = dense_reduced.copy()
+    sys2 = dense_reduced.copy()
+    sys1_sparse = sparse_reduced.copy()
+    sys2_sparse = sparse_reduced.copy()
+    
+    # Perform substructuring by position
+    system_cb_combined, geometry_cb_combined = sdpy.System.substructure_by_position([sys1, sys2], [geom1, geom2])
+    system_sparse_cb_combined, geometry_sparse_cb_combined = sdpy.System.substructure_by_position([sys1_sparse, sys2_sparse], [geom1, geom2])
+    
+    print(f"Combined system DOFs: {system_cb_combined.ndof}")
+    print(f"Combined sparse system DOFs: {system_sparse_cb_combined.ndof}")
+    
+    # Calculate eigenfrequencies for both combined systems
+    combined_shapes = system_cb_combined.eigensolution(15)
+    combined_sparse_shapes = system_sparse_cb_combined.eigensolution(15)
+    
+    # Skip first 6 modes (rigid body) and compare structural frequencies
+    combined_freq_structural = np.sort(combined_shapes.frequency[6:])
+    combined_sparse_freq_structural = np.sort(combined_sparse_shapes.frequency[6:])
+    
+    print(f"Combined dense frequencies: {combined_freq_structural}")
+    print(f"Combined sparse frequencies: {combined_sparse_freq_structural}")
+    
+    # Compare the eigenfrequencies
+    assert len(combined_freq_structural) == len(combined_sparse_freq_structural)
+    assert np.allclose(combined_freq_structural, combined_sparse_freq_structural, rtol=1e-2)
+    
+    print("Substructuring eigenfrequency comparison passed!")
 
 def test_proportional_damping(sparse_beam_system):
     """Test proportional damping assignment"""
