@@ -2202,9 +2202,9 @@ class SystemSparse(System):
         """
         # Construct craig bampton transformation
         if isinstance(connection_degrees_of_freedom, CoordinateArray):
-            # if not sp.issparse(self.transformation) or not np.allclose(self.transformation.toarray(), np.eye(*self.transformation.shape)):
-            #     raise ValueError(
-            #         'Coordinates can only be specified with a CoordinateArray if the transformation is identity')
+            if not sp.issparse(self.transformation) or not self._is_sparse_identity(self.transformation):
+                raise ValueError(
+                    'Coordinates can only be specified with a CoordinateArray if the transformation is identity')
             connection_indices = self.get_indices_by_coordinate(connection_degrees_of_freedom)
         else:
             connection_indices = np.array(connection_degrees_of_freedom)
@@ -2260,6 +2260,38 @@ class SystemSparse(System):
             return self.reduce(T_cb_reordered), shapes
         else:
             return self.reduce(T_cb_reordered)
+        
+    def _is_sparse_identity(self, matrix, tol=1e-12):
+        """
+        Efficiently check if a sparse matrix is an identity matrix without converting to dense.
+        
+        Parameters
+        ----------
+        matrix : scipy.sparse matrix
+            The sparse matrix to check
+        tol : float, optional
+            Tolerance for numerical comparison
+            
+        Returns
+        -------
+        bool
+            True if matrix is identity, False otherwise
+        """
+        # Quick checks first
+        if matrix.shape[0] != matrix.shape[1]:
+            return False
+        
+        # Most efficient approach: subtract identity matrix and check if result is zero
+        # This avoids creating dense matrices and leverages scipy's efficient sparse operations
+        identity = sp.identity(matrix.shape[0], format=matrix.format)
+        diff = matrix - identity
+        
+        # If difference has no non-zero elements, matrices are identical
+        if diff.nnz == 0:
+            return True
+        
+        # If there are non-zero differences, check if they're within tolerance
+        return np.allclose(diff.data, 0.0, atol=tol, rtol=tol)
 
     def save(self, filename):
         """
