@@ -704,9 +704,32 @@ class ShapeArray(sdynpy_array.SdynpyArray):
             append_shape = shape_array(coords_not_in_shape, append_shape_matrix)
             # Append it
             self = ShapeArray.concatenate_dofs((self, append_shape))
-        shape_matrix = self[coordinates].reshape(*self.shape, *coordinates.shape)
-        new_shape_matrix = np.einsum('nij,nkj,...nk->...ni', transform_to_new,
-                                     transform_from_original, shape_matrix)
+        # Build transformation without mixing translations and rotations
+        if not rotations:
+            shape_matrix = self[coordinates].reshape(*self.shape, *coordinates.shape)
+            new_shape_matrix = np.einsum('nij,nkj,...nk->...ni', transform_to_new,
+                                         transform_from_original, shape_matrix)
+        else:
+            # Separate translational (1–3) and rotational (4–6) subspaces
+            coords_t = sdynpy_coordinate.coordinate_array(common_nodes[:, np.newaxis], [1, 2, 3])
+            coords_r = sdynpy_coordinate.coordinate_array(common_nodes[:, np.newaxis], [4, 5, 6])
+
+            # Slice precomputed direction fields into 3x3 blocks (per node)
+            to_t = transform_to_new[:, 0:3, :]
+            from_t = transform_from_original[:, 0:3, :]
+            to_r = transform_to_new[:, 3:6, :]
+            from_r = transform_from_original[:, 3:6, :]
+
+            # Old coefficients by block
+            shape_matrix_t = self[coords_t].reshape(*self.shape, *coords_t.shape)
+            shape_matrix_r = self[coords_r].reshape(*self.shape, *coords_r.shape)
+
+            # Apply block-diagonal transforms (no translation↔rotation mixing)
+            new_t = np.einsum('nij,nkj,...nk->...ni', to_t, from_t, shape_matrix_t)
+            new_r = np.einsum('nij,nkj,...nk->...ni', to_r, from_r, shape_matrix_r)
+
+            # Concatenate back to [1,2,3,4,5,6] order within each node
+            new_shape_matrix = np.concatenate([new_t, new_r], axis=-1)
         return shape_array(coordinates.flatten(), new_shape_matrix.reshape(*self.shape, -1), self.frequency, self.damping, self.modal_mass,
                            self.comment1, self.comment2, self.comment3, self.comment4, self.comment5)
 
