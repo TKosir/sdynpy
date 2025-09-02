@@ -561,7 +561,10 @@ class ShapeArray(sdynpy_array.SdynpyArray):
         if isinstance(nodelist_or_coordinate_array, sdynpy_coordinate.CoordinateArray):
             coord_array = nodelist_or_coordinate_array
         else:
-            coord_array = np.unique(self.coordinate)
+            if np.all(np.all(self.coordinate == self.coordinate[0,:], axis=0)) == True:
+                coord_array = self.coordinate[0,:] # speeds up the system creation
+            else:
+                coord_array = np.unique(self.coordinate)
             coord_array = coord_array[np.in1d(coord_array.node, nodelist_or_coordinate_array)]
         shape_matrix = self[coord_array.flatten()]
         return shape_array(coord_array.flatten(), shape_matrix, self.frequency, self.damping,
@@ -1154,7 +1157,10 @@ class ShapeArray(sdynpy_array.SdynpyArray):
         if self.is_complex():
             raise NotImplementedError('Complex Modes Not Implemented Yet')
         else:
-            coordinates = np.unique(self.coordinate)
+            if np.all(np.all(self.coordinate == self.coordinate[0,:], axis=0)) == True:
+                coordinates = self.coordinate[0,:] # speeds up the system creation
+            else:
+                coordinates = np.unique(self.coordinate)
             return sdynpy_system.System(coordinates, np.diag(self.flatten().modal_mass),
                                         np.diag((2 * np.pi * self.frequency.flatten())
                                                 ** 2 * self.flatten().modal_mass),
