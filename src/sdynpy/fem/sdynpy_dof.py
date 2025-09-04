@@ -244,6 +244,27 @@ class BoundaryNodeExtractor:
     """
 
     def _validate_node_array(self, node_in: NodeArray) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Validate and extract fields from a SDynPy NodeArray.
+        
+        Parameters
+        ----------
+        node_in : NodeArray
+            Input node array to validate and extract fields from.
+            
+        Returns
+        -------
+        tuple
+            (node_ids, node_xyz, node_color, node_def_cs, node_disp_cs)
+            All required and optional fields from the node array.
+            
+        Raises
+        ------
+        TypeError
+            If node_in is not a structured numpy array.
+        ValueError
+            If required fields ('id', 'coordinate') are missing.
+        """
         if not isinstance(node_in, np.ndarray) or node_in.dtype.names is None:
             raise TypeError("node_in must be a SDynPy NodeArray (structured array).")
         node_ids  = self._safe_field(node_in, 'id')
@@ -256,6 +277,26 @@ class BoundaryNodeExtractor:
         return node_ids, node_xyz, node_color, node_def_cs, node_disp_cs
 
     def _validate_element_array(self, elem_in: ElementArray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Validate and extract fields from a SDynPy ElementArray.
+        
+        Parameters
+        ----------
+        elem_in : ElementArray
+            Input element array to validate and extract fields from.
+            
+        Returns
+        -------
+        tuple
+            (elem_type, elem_conn) - Element types and connectivity arrays.
+            
+        Raises
+        ------
+        TypeError
+            If elem_in is not a structured numpy array.
+        ValueError
+            If required fields ('type', 'connectivity') are missing.
+        """
         if not isinstance(elem_in, np.ndarray) or elem_in.dtype.names is None:
             raise TypeError("elem_in must be a SDynPy ElementArray (structured array).")
         elem_type = self._safe_field(elem_in, 'type')
@@ -273,6 +314,29 @@ class BoundaryNodeExtractor:
         node_def_cs: Optional[np.ndarray],
         node_disp_cs: Optional[np.ndarray],
     ) -> NodeArray:
+        """
+        Build a NodeArray from selected node IDs and original node data.
+        
+        Parameters
+        ----------
+        used_ids : np.ndarray
+            Array of node IDs to include in the output.
+        id2idx : Dict[int, int]
+            Mapping from node ID to index in original arrays.
+        node_xyz : np.ndarray
+            Original node coordinates array.
+        node_color : Optional[np.ndarray]
+            Original node colors array (may be None).
+        node_def_cs : Optional[np.ndarray]
+            Original node definition coordinate system array (may be None).
+        node_disp_cs : Optional[np.ndarray]
+            Original node displacement coordinate system array (may be None).
+            
+        Returns
+        -------
+        NodeArray
+            New NodeArray containing only the selected nodes with all available fields.
+        """
         used_idx = np.array([id2idx[int(n)] for n in used_ids], dtype=np.int64)
         kwargs = dict(id=used_ids, coordinate=node_xyz[used_idx])
         if node_color is not None:
@@ -290,18 +354,43 @@ class BoundaryNodeExtractor:
         boundary_set: Optional[set[int]],
     ) -> Dict[Tuple[int, ...], List[int]]:
         """
-        Build a map of faces -> original corner node IDs (winding as defined by templates).
+        Build a map of faces to corner node IDs for boundary extraction.
         
-        If boundary_set is provided:
-        1. Consider only elements that have at least one corner node in boundary_set
-        2. Extract all faces from those elements (for boundary detection within subset)
-        3. Filter final faces to keep only those with all corner nodes in boundary_set
+        This is the core method that processes all elements and extracts boundary faces.
+        Faces that are shared between elements are marked as None and removed.
         
-        If boundary_set is None, process all elements normally.
-        
-        For 3D elements (solid, thick shell): Extract boundary faces
-        For 2D elements (thin shell, plate, membrane): Pass through as already boundary
-        Unknown element types raise a ValueError.
+        Parameters
+        ----------
+        elem_type : np.ndarray
+            Array of element type codes.
+        elem_conn : np.ndarray
+            Array of element connectivity arrays.
+        boundary_set : Optional[set[int]]
+            Set of node IDs to restrict boundary extraction to. If provided:
+            1. Only elements with at least one corner node in this set are considered
+            2. Only faces with all corner nodes in this set are kept in final output
+            If None, process all elements normally.
+            
+        Returns
+        -------
+        Dict[Tuple[int, ...], List[int]]
+            Mapping from sorted node ID tuples to original face node IDs.
+            Only contains boundary faces (not shared between elements).
+            
+        Algorithm
+        ---------
+        For 3D elements (solid, thick shell):
+            - Extract all faces using corner nodes only
+            - Faces shared between elements are removed
+            
+        For 2D elements (thin shell, plate, membrane):
+            - Elements are passed through as they are already boundaries
+            - No face extraction needed
+            
+        Raises
+        ------
+        ValueError
+            If an unsupported element type is encountered.
         """
         face_map: Dict[Tuple[int, ...], Optional[List[int]]] = {}
 
@@ -405,6 +494,33 @@ class BoundaryNodeExtractor:
         return kept
 
     def _build_elements_from_faces(self, kept_faces: List[List[int]]) -> ElementArray:
+        """
+        Build an ElementArray from a list of boundary faces.
+        
+        Parameters
+        ----------
+        kept_faces : List[List[int]]
+            List of faces, where each face is a list of node IDs.
+            Faces can be triangular (3 nodes) or quadrilateral (4 nodes).
+            
+        Returns
+        -------
+        ElementArray
+            New ElementArray containing the boundary faces as 2D elements.
+            Triangular faces become type 41 (plane stress triangles).
+            Quadrilateral faces become type 44 (plane stress quads).
+            
+        Raises
+        ------
+        ValueError
+            If a face has an unsupported number of nodes (not 3 or 4).
+            
+        Notes
+        -----
+        Element IDs are assigned sequentially starting from 1.
+        All elements are assigned color 1.
+        Triangular elements are placed before quadrilateral elements.
+        """
         tri_conns: List[Tuple[int, int, int]] = []
         quad_conns: List[Tuple[int, int, int, int]] = []
         for face_ids in kept_faces:
@@ -450,7 +566,43 @@ class BoundaryNodeExtractor:
         elem_in: ElementArray,
         boundary_node_ids: Optional[Iterable[int]] = None,
         include_node_ids: Optional[Iterable[int]] = None,
-    ) -> Tuple[NodeArray, ElementArray]:
+    ) -> None:
+        """
+        Initialize the boundary node extractor and perform extraction.
+        
+        Parameters
+        ----------
+        node_in : NodeArray
+            Input nodes containing geometry and properties.
+        elem_in : ElementArray
+            Input elements defining connectivity and types.
+        boundary_node_ids : Optional[Iterable[int]], default=None
+            Node IDs to restrict boundary extraction to. If provided:
+            - Only elements with corner nodes in this set are considered
+            - Only faces with all corner nodes in this set are kept
+            - Effectively allows extraction of boundaries within a subset
+        include_node_ids : Optional[Iterable[int]], default=None
+            Additional node IDs to include in output without connectivity.
+            Useful for including isolated nodes or reference points.
+            
+        Raises
+        ------
+        TypeError
+            If node_in or elem_in are not proper SDynPy arrays.
+        ValueError
+            If required fields are missing, node IDs are not unique,
+            or include_node_ids reference non-existent nodes.
+            Also raised if unsupported element types are encountered.
+            
+        Notes
+        -----
+        The extraction is performed immediately during initialization.
+        Results are stored and accessed via get_node_out() and get_elem_out().
+        
+        For 3D elements: Boundary faces are extracted using corner nodes only.
+        For 2D elements: Elements are passed through as they're already boundaries.
+        Higher-order elements are linearized by using only corner nodes.
+        """
         # Validate inputs
         node_ids, node_xyz, node_color, node_def_cs, node_disp_cs = self._validate_node_array(node_in)
         elem_type, elem_conn = self._validate_element_array(elem_in)
@@ -503,13 +655,45 @@ class BoundaryNodeExtractor:
         self.elem_out = elem_out
 
     def get_node_out(self) -> NodeArray:
+        """
+        Get the extracted boundary nodes.
+        
+        Returns
+        -------
+        NodeArray
+            Boundary nodes with all available fields (coordinates, colors, etc.).
+            Includes nodes from boundary faces plus any requested include_node_ids.
+        """
         return self.node_out
     
     def get_elem_out(self) -> ElementArray:
+        """
+        Get the extracted boundary elements.
+        
+        Returns
+        -------
+        ElementArray
+            Boundary elements as 2D triangles (type 41) and quads (type 44).
+            For 3D elements: boundary faces extracted from solid elements.
+            For 2D elements: original elements passed through.
+        """
         return self.elem_out
     
     @staticmethod
     def _is_sequence_of_ints(x: Iterable[int]) -> bool:
+        """
+        Check if an iterable contains only values convertible to integers.
+        
+        Parameters
+        ----------
+        x : Iterable[int]
+            Iterable to check for integer-convertible values.
+            
+        Returns
+        -------
+        bool
+            True if all values can be converted to integers, False otherwise.
+        """
         try:
             for v in x:
                 _ = int(v)
@@ -519,4 +703,22 @@ class BoundaryNodeExtractor:
 
     @staticmethod
     def _safe_field(a: np.ndarray, name: str, default=None):
+        """
+        Safely extract a field from a structured numpy array.
+        
+        Parameters
+        ----------
+        a : np.ndarray
+            Structured numpy array to extract field from.
+        name : str
+            Name of the field to extract.
+        default : Any, default=None
+            Value to return if field doesn't exist.
+            
+        Returns
+        -------
+        Any
+            Field data if it exists, otherwise default value.
+        """
         return a[name] if (a.dtype.names and name in a.dtype.names) else default
+
