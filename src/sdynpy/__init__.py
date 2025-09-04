@@ -23,6 +23,7 @@ from .fem.sdynpy_exodus import Exodus, ExodusInMemory
 from .fem import sdynpy_beam as beam
 from .fem import sdynpy_shaker as shaker
 from .fem import sdynpy_dof as dof
+from .fem import sdynpy_mesh as mesh
 from .signal_processing import (frf, cpsd, integration, correlation, complex,
                                 rotation, generator, camera, harmonic,
                                 geometry_fitting, srs, lrm)

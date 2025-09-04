@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 from sdynpy.core.sdynpy_geometry import node_array, element_array
-from sdynpy.fem.sdynpy_dof import BoundaryNodeExtractor
+from sdynpy.fem.sdynpy_mesh import BoundaryNodeExtractor
 
 
 class TestBoundaryNodeExtractor:
